@@ -3,4 +3,4 @@
 pymodbus>=3.14.0,<3.15.0
 requests~=2.34
 paho-mqtt~=2.1
-psycopg[binary]~=3.2
+psycopg[binary]~=3.3

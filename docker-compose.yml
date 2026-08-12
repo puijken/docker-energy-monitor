@@ -11,16 +11,18 @@ services:
       - POSTGRES_DB=energy
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      # Broker used both to publish solar values and to consume DSMR-reader's exports
+      # Broker used to publish solar values and (if ENABLE_PLUGS) to consume Zigbee2MQTT
       - MQTT_HOST=192.168.1.10
       - MQTT_USERNAME=${MQTT_USERNAME}
       - MQTT_PASSWORD=${MQTT_PASSWORD}
       - MQTT_TOPIC_PREFIX=energy/solar
-      # Smart meter, via DSMR-reader's MQTT export (enable the JSON exports in its admin UI)
-      - ENABLE_DSMR=true
-      - DSMR_TOPIC_ELEC=dsmr/json/elec
-      - DSMR_TOPIC_GAS=dsmr/json/gas
-      - DSMR_TOPIC_DAY=dsmr/day-consumption
+      # Smart meter, read directly off the P1 telegram stream -- a plain-TCP relay of the meter's
+      # P1 port (e.g. a ser2net `connection:` block), not DSMR-reader's MQTT export or database.
+      # See README.md ("Smart-meter data") for why, and for sharing one P1 port between this
+      # container and something else that also reads it (DSMR-reader, a display, etc.).
+      - ENABLE_P1=true
+      - P1_HOST=192.168.1.20
+      - P1_PORT=2001
       - ENABLE_PVOUTPUT=false
       - PVOUTPUT_API_KEY=${PVOUTPUT_API_KEY}
       - PVOUTPUT_SYSTEM_ID=${PVOUTPUT_SYSTEM_ID}

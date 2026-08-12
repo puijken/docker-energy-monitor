@@ -1,23 +1,24 @@
 # Energy Monitor
 
 Collects whole-house energy data into one TimescaleDB (Postgres): solar generation read from a
-Sungrow inverter over Modbus TCP, and electricity/gas consumption taken from DSMR-reader's MQTT
-export. Publishes solar values to MQTT, and optionally uploads to PVOutput (every few minutes) and
-Mindergas (once daily). Built as a self-maintained replacement for the third-party
-`bohdans/sungather` image.
+Sungrow inverter over Modbus TCP, and electricity/gas consumption read directly off the P1 smart
+meter's telegram stream over the network. Publishes solar values to MQTT, and optionally uploads
+to PVOutput (every few minutes) and Mindergas (once daily). Built as a self-maintained replacement
+for the third-party `bohdans/sungather` image.
 
 ## Features
 
 - Polls the inverter every `SCAN_INTERVAL` seconds over Modbus TCP (function code 4 / input
   registers): generation power, daily and lifetime yield, DC/MPPT voltage & current, phase voltage,
   internal temperature.
-- Subscribes to DSMR-reader's JSON MQTT topics for smart-meter electricity and gas readings, and
-  writes those to the same database too — so one place holds generation *and* consumption.
+- Connects to a plain-TCP relay of the meter's P1 port and parses DSMR telegrams itself
+  (CRC-verified) for smart-meter electricity and gas readings, and writes those to the same
+  database too — so one place holds generation *and* consumption, with no other project's exporter
+  in the path.
 - Writes every reading to TimescaleDB (`solar` table, `source=sungrow`; smart-meter data under
-  `electricity` / `gas_positions` / `electricity_day_totals` with `source=dsmr`). Fields not in a
-  table's fixed columns land in an `extra` JSONB column instead of failing the write, so enabling
-  a new DSMR/plug field needs no code change here — see [Smart plugs](#smart-plugs-zigbee2mqtt)
-  for what that keeps schemaless.
+  `electricity` / `gas_positions` with `source=p1`). Fields not in a table's fixed columns land in
+  an `extra` JSONB column instead of failing the write, so enabling a new OBIS/plug field needs no
+  code change here — see [Smart plugs](#smart-plugs-zigbee2mqtt) for what that keeps schemaless.
 - Publishes the same values to MQTT, one topic per field under `MQTT_TOPIC_PREFIX`.
 - Optionally pushes a status update to PVOutput on an interval (gated by `ENABLE_PVOUTPUT`,
   default off).
@@ -60,15 +61,15 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `MQTT_PASSWORD` | *(none)* | MQTT password, if required |
 | `MQTT_TOPIC_PREFIX` | `energy/solar` | Topic prefix; one sub-topic per field |
 | `MQTT_PUBLISH_FIELDS` | *(all)* | Comma-separated register names to publish, e.g. `total_active_power,run_state`. Leave unset to publish everything. |
-| `ENABLE_DSMR` | `true` | Subscribe to DSMR-reader's MQTT topics for smart-meter data |
-| `DSMR_TOPIC_ELEC` | `dsmr/json/elec` | DSMR-reader JSON telegram topic |
-| `DSMR_TOPIC_GAS` | `dsmr/json/gas` | DSMR-reader JSON gas consumption topic |
-| `DSMR_TOPIC_DAY` | `dsmr/day-consumption` | DSMR-reader JSON day totals topic |
-| `DSMR_ELEC_TABLE` | `electricity` | Table for the electricity telegram |
-| `DSMR_GAS_TABLE` | `gas_positions` | Table for gas readings |
-| `DSMR_DAY_TABLE` | `electricity_day_totals` | Table for day totals |
-| `DSMR_MAX_DATA_AGE` | `300` | Cached meter values older than this count as absent |
-| `ENABLE_DERIVED` | `true` | Write `power_flow` (solar/grid/house at one instant), combining the latest cached inverter and DSMR readings whenever either updates |
+| `ENABLE_P1` | `false` | Connect to a P1 telegram relay for smart-meter data. See [Smart-meter data](#smart-meter-data). |
+| `P1_HOST` | *required if `ENABLE_P1=true`* | Host/IP of the P1 telegram relay |
+| `P1_PORT` | `2001` | Port of the P1 telegram relay |
+| `ELEC_TABLE` | `electricity` | Table for electricity readings |
+| `GAS_TABLE` | `gas_positions` | Table for gas readings |
+| `P1_WARN_AFTER` | `60` | Seconds without a telegram before warning the connection looks stalled |
+| `P1_MAX_DATA_AGE` | `300` | Cached electricity values older than this count as absent |
+| `P1_MIN_INTERVAL` | `SCAN_INTERVAL` | Minimum seconds between Postgres writes of electricity data (telegrams arrive roughly once a second); the in-memory cache still updates every telegram regardless, so PVOutput/`power_flow` always see the latest reading |
+| `ENABLE_DERIVED` | `true` | Write `power_flow` (solar/grid/house at one instant), combining the latest cached inverter and P1 electricity readings whenever either updates |
 | `DERIVED_TABLE` | `power_flow` | Table written to |
 | `SOLAR_STALE_AFTER` | `120` | Seconds after which a stale inverter poll is treated as "not producing" (0 W) rather than reused, for `power_flow` purposes. See [Why power_flow updates from two triggers](#why-power_flow-updates-from-two-triggers). |
 | `ENABLE_PLUGS` | `false` | Subscribe to configured Zigbee2MQTT smart-plug topics for per-circuit submetering. See [Smart plugs](#smart-plugs-zigbee2mqtt). |
@@ -86,7 +87,7 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `MINDERGAS_API_KEY` | *(none)* | Required if `ENABLE_MINDERGAS=true` |
 | `MINDERGAS_HOUR` / `MINDERGAS_MINUTE` | `0` / `5` | Local time-of-day the daily Mindergas push fires |
 | `MINDERGAS_RETRY_INTERVAL` | `900` | Seconds to wait before retrying a failed daily push (retries stay within `MINDERGAS_HOUR`) |
-| `MINDERGAS_GAS_TABLE` | `gas_positions` | Table this container's own DSMR ingestion writes gas readings to |
+| `MINDERGAS_GAS_TABLE` | `gas_positions` | Table this container's own P1 ingestion writes gas readings to |
 | `MINDERGAS_GAS_FIELD` | `delivered` | Column name within that table |
 | `TZ` | *(container default)* | Timezone for scheduling/logging |
 
@@ -99,7 +100,7 @@ default, `WARNING`, is the minimal-logging setting for normal operation:
 |---|---|---|
 | `WARNING` (default) | Config problems, connection loss/refusal, a full write queue, a stale poll skipping an upload, and every caught exception (always logged at error severity with a traceback, regardless of this setting) | Normal operation. Silences the 5-second poll heartbeat and routine push confirmations, so healthy running produces no output at all. |
 | `INFO` | The above, plus the recurring poll heartbeat (`Poll ok: ac=...`), startup/connection confirmations, and successful PVOutput/Mindergas pushes | Confirming the container is alive and doing what's expected, without full per-field detail. |
-| `DEBUG` | The above, plus per-field detail such as a DSMR value that failed to parse and was dropped | Diagnosing a specific data problem, e.g. a smart-meter field arriving as something unexpected. |
+| `DEBUG` | The above, plus per-field detail such as a plug field that failed to parse and was dropped | Diagnosing a specific data problem, e.g. a smart-plug field arriving as something unexpected. |
 | `ERROR` | Only config problems and caught exceptions | Quieter than the default; loses the connection-state warnings (MQTT disconnects, a full write queue), which are usually the useful signal before something breaks outright. |
 | `CRITICAL` | Practically nothing — this file has no `log.critical` calls | Not useful here; included only because it's one of Python's standard levels. |
 
@@ -132,36 +133,69 @@ and `total_active_power` (AC) sits just below it with a realistic conversion los
 
 ## Smart-meter data
 
-Electricity and gas come from **DSMR-reader's own MQTT export**, not from its database, REST API or
-InfluxDB export. Enable the JSON exports in DSMR-reader's admin UI (Configuration → MQTT) pointing
-at the same broker this container uses, and set the topics here to match:
+Electricity and gas are read **directly off the P1 telegram stream**, not via a third-party
+tool's MQTT export, database or REST API. `ENABLE_P1=true` plus `P1_HOST`/`P1_PORT` point this
+container at a plain-TCP relay of the meter's P1 port — a ser2net `connection:` block is the
+usual case, but anything that forwards the raw serial byte stream over TCP works.
 
-| Source key | Variable | DSMR-reader export | Written to table |
-|---|---|---|---|
-| `elec` | `DSMR_TOPIC_ELEC` | JSON telegram | `DSMR_ELEC_TABLE` (`electricity`) |
-| `gas` | `DSMR_TOPIC_GAS` | JSON gas consumption | `DSMR_GAS_TABLE` (`gas_positions`) |
-| `day` | `DSMR_TOPIC_DAY` | JSON day totals | `DSMR_DAY_TABLE` (`electricity_day_totals`) |
+Each telegram is:
 
-Each message is parsed, coerced to numbers (DSMR-reader publishes every value as a JSON string),
-cached in memory for the PVOutput metrics, and written to Postgres. Non-numeric fields are skipped
-rather than written as strings. Subscriptions are re-established on every reconnect, so a broker
-restart doesn't silently leave the container deaf.
+1. **Framed and CRC-verified** (`extract_telegram`/`crc16_arc` in `app.py`) — a torn or corrupted
+   read is logged and discarded rather than trusted, since a plausible-looking but wrong meter
+   reading is worse than a gap.
+2. **Parsed by OBIS code** (`parse_p1_telegram`) into electricity fields (cumulative import/export
+   per tariff, instantaneous power, voltage) and, if present, a gas reading. The gas M-Bus channel
+   isn't assumed to be a fixed number — it's discovered per telegram by scanning for the
+   device-type-003 line, the same way DSMR-reader itself does.
+3. **Cached in memory** for the PVOutput metrics (electricity only — see below) and **written to
+   Postgres** (`ELEC_TABLE`/`GAS_TABLE`, default `electricity`/`gas_positions`).
 
-Why MQTT and not the alternatives:
+Gas is re-sampled by the meter only every ~5 minutes but repeated in every telegram in between;
+`_handle_p1_telegram` skips the write when neither the M-Bus capture timestamp nor the value has
+moved, so this doesn't produce one row per second.
 
-- **DSMR-reader's InfluxDB export cannot work against InfluxDB 3.** Its client calls
-  `find_bucket_by_name()` before writing, and InfluxDB 3 has no `/api/v2/buckets` endpoint — it
-  returns 404, so the export fails before the (otherwise working) write is attempted.
-- **Reading the P1 meter directly is not possible** when a ser2net-style bridge already feeds
-  DSMR-reader: those endpoints accept a single client and answer `Port already in use`.
-- The database and REST API would both work, but MQTT needs no schema coupling, no extra
-  credentials, and no network changes — the broker connection already exists for publishing.
+**Two things a raw telegram cannot provide**, both deliberate gaps rather than oversights:
+
+- **Day totals.** A third-party tool like DSMR-reader computes these from its own history; the
+  telegram itself carries no running-total-since-midnight field. There is no
+  `daily_import_wh`/`daily_export_wh`/`daily_house_energy_wh` PVOutput metric here for that reason
+  — only the lifetime (`total_*`) and instantaneous (`grid_*`/`house_power_w`) equivalents exist.
+- **Gas flow rate.** Only the cumulative `delivered` reading is parsed; a current-flow-rate figure
+  would need two readings' timestamps and values, which isn't worth it for a value that changes
+  this slowly.
+
+### Sharing the P1 port with something else that also reads it
+
+A P1 port classically accepts only one TCP client, which blocks this container from reading it
+directly if something else (DSMR-reader, a display) already has the one connection ser2net
+allows. **The fix is on the serial-to-network bridge, not in this container**: ser2net (4.x+,
+YAML config) can define two independent `connection:` blocks that both point at the same serial
+device, each on its own TCP port —
+
+```yaml
+connection: &con01
+    accepter: tcp,2000
+    enable: on
+    connector: serialdev,/dev/ttyUSB0,115200n81,local
+
+connection: &con02
+    accepter: tcp,2001
+    enable: on
+    connector: serialdev,/dev/ttyUSB0,115200n81,local
+```
+
+— confirmed live: both connections read the same telegrams simultaneously with no "port already
+in use" conflict, since the P1 port is receive-only from the meter's side (nothing ever writes
+back to it, so there's no exclusivity to fight over). The existing client keeps its original
+port; this container gets the new one. A single ser2net `max-connections` setting on one
+connection block is *not* the right knob for this — that key doesn't exist in ser2net's schema;
+two separate connection blocks is the supported pattern.
 
 ## Why power_flow updates from two triggers
 
 `power_flow` (solar/grid/house at one instant) was originally only written from the inverter poll
-loop, using whatever DSMR reading happened to be cached at that moment. That silently broke every
-night: this inverter goes fully offline overnight (Modbus stops responding entirely, not just
+loop, using whatever smart-meter reading happened to be cached at that moment. That silently broke
+every night: this inverter goes fully offline overnight (Modbus stops responding entirely, not just
 idling at 0 W), so the poll loop's every attempt raised and nothing got written — not even a "0 W
 solar" point — for as long as the inverter was asleep. The smart meter, meanwhile, keeps reporting
 all night, so `electricity`'s own data never had a gap; only the derived `power_flow` table did,
@@ -169,11 +203,11 @@ and a Grafana chart spanning that gap just drew a straight line across it, which
 reading rather than a legitimate outage — the actual symptom that first surfaced this.
 
 Fixed by writing `power_flow` from **either** side updating: the existing poll-loop trigger for
-when the inverter is responding, plus a second trigger from every fresh DSMR `elec` message
-(`_handle_dsmr_message` in `app.py`), each using the other side's latest cached value. On the DSMR
-side, the inverter's contribution comes from `_solar_power_for_derived()`: the last poll's value if
-it's within `SOLAR_STALE_AFTER`, otherwise `0.0` — deliberately zeroed rather than omitted, since a
-stale solar poll here reliably means "asleep, not producing", unlike a DSMR outage (genuinely
+when the inverter is responding, plus a second trigger from every P1 telegram carrying electricity
+data (`_handle_p1_telegram` in `app.py`), each using the other side's latest cached value. On the
+P1 side, the inverter's contribution comes from `_solar_power_for_derived()`: the last poll's value
+if it's within `SOLAR_STALE_AFTER`, otherwise `0.0` — deliberately zeroed rather than omitted, since
+a stale solar poll here reliably means "asleep, not producing", unlike a P1 outage (genuinely
 unknown, so `derived_fields()` still omits grid/house rather than guessing). During the day, when
 both sides are updating every few seconds, this doubles `power_flow`'s write rate — harmless at
 TimescaleDB's scale, and still just one row per instant either trigger fires.
@@ -181,9 +215,9 @@ TimescaleDB's scale, and still just one row per instant either trigger fires.
 ## Smart plugs (Zigbee2MQTT)
 
 Optionally submeters individual circuits from metering Zigbee smart plugs published by
-Zigbee2MQTT onto the same broker DSMR uses. Enable with `ENABLE_PLUGS=true` and list the topics
-to subscribe to in `PLUG_TOPICS` as `topic=label` pairs; each label becomes the `source` column
-value in `PLUG_TABLE` (default `smart_plugs`).
+Zigbee2MQTT onto the MQTT broker this container connects to. Enable with `ENABLE_PLUGS=true` and
+list the topics to subscribe to in `PLUG_TOPICS` as `topic=label` pairs; each label becomes the
+`source` column value in `PLUG_TABLE` (default `smart_plugs`).
 
 Unlike DSMR there is no fixed schema to map: different plug models publish different extra
 fields (e.g. an Aqara plug's `device_temperature`/`power_outage_count` vs. a Tuya plug's
@@ -217,25 +251,26 @@ The defaults reproduce exactly what the previous SunGather setup sent:
 | `dc_power_w` | W | inverter | Combined MPPT DC input |
 | `inverter_voltage_v` | V | inverter | Grid voltage as the inverter measures it |
 | `inverter_temp_c` | °C | inverter | **Heatsink**, not ambient (~50 °C running) — mapping this to `v5` will skew PVOutput's insolation figures, which is why the old setup left it off |
-| `grid_import_w` | W | meter (`elec`) | Currently drawn from the grid |
-| `grid_export_w` | W | meter (`elec`) | Currently fed back |
-| `grid_voltage_v` | V | meter (`elec`) | Voltage as the smart meter measures it |
-| `total_import_wh` | Wh | meter (`elec`) | Lifetime, both tariffs summed |
-| `total_export_wh` | Wh | meter (`elec`) | Lifetime, both tariffs summed |
-| `daily_import_wh` | Wh | meter (`day`) | Today's import so far |
-| `daily_export_wh` | Wh | meter (`day`) | Today's export so far |
-| `house_power_w` | W | derived (`elec`) | `generation + import − export` — what the house actually uses |
-| `total_house_energy_wh` | Wh | derived (`elec`) | Lifetime equivalent of the above |
-| `daily_house_energy_wh` | Wh | derived (`day`) | Day-total equivalent of the above |
+| `grid_import_w` | W | meter | Currently drawn from the grid |
+| `grid_export_w` | W | meter | Currently fed back |
+| `grid_voltage_v` | V | meter | Voltage as the smart meter measures it |
+| `total_import_wh` | Wh | meter | Lifetime, both tariffs summed |
+| `total_export_wh` | Wh | meter | Lifetime, both tariffs summed |
+| `house_power_w` | W | derived | `generation + import − export` — what the house actually uses |
+| `total_house_energy_wh` | Wh | derived | Lifetime equivalent of the above |
 
-Metrics sourced from the **meter** read the cached MQTT payloads described in
-[Smart-meter data](#smart-meter-data) — `elec` means `DSMR_TOPIC_ELEC`, `day` means
-`DSMR_TOPIC_DAY`. No Postgres query is involved, so these stay usable even while Postgres writes
-are failing.
+There's no day-total equivalent of `house_power_w`/`grid_import_w` (a `daily_import_wh` or
+similar) — the raw P1 telegram carries no running-total-since-midnight field, only cumulative
+lifetime and instantaneous values; see [Smart-meter data](#smart-meter-data).
 
-If a required payload hasn't arrived, or is older than `DSMR_MAX_DATA_AGE`, the parameters needing
-it are dropped and the upload still goes out with the inverter-only values. A stopped DSMR-reader
-therefore degrades the upload rather than losing it or reporting figures from hours ago.
+Metrics sourced from the **meter** or **derived** from it read the cached P1 electricity reading
+(`get_elec_values()` in `app.py`). No Postgres query is involved, so these stay usable even while
+Postgres writes are failing.
+
+If no electricity reading has arrived yet, or the cached one is older than `P1_MAX_DATA_AGE`, the
+parameters needing it are dropped and the upload still goes out with the inverter-only values. A
+stalled P1 connection therefore degrades the upload rather than losing it or reporting figures
+from hours ago.
 
 ### Reporting consumption as well as generation
 
@@ -275,10 +310,10 @@ answer however far back it turns out to be.
 The upload fires at `MINDERGAS_HOUR:MINDERGAS_MINUTE` (default 00:05 local), inside the 00:05–01:00
 window Mindergas asks uploaders to use so their server load stays spread out.
 
-Unlike the PVOutput metrics this reads from **Postgres**, not the MQTT cache — it needs the value as
-it stood before midnight, which requires timestamped history rather than the latest value. It reads
-the gas data this container itself wrote (`MINDERGAS_GAS_TABLE` defaults to `DSMR_GAS_TABLE`), so
-the two stay consistent automatically.
+Unlike the PVOutput metrics this reads from **Postgres**, not an in-memory cache — it needs the
+value as it stood before midnight, which requires timestamped history rather than the latest
+value. It reads the gas data this container itself wrote from the P1 telegram stream
+(`MINDERGAS_GAS_TABLE` defaults to `GAS_TABLE`), so the two stay consistent automatically.
 
 Timestamps are timezone-aware on purpose: Postgres stores `timestamptz` as UTC and interprets a
 naive value as the session's local time, so passing naive local time here would be ambiguous.

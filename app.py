@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import queue
+import re
+import socket
 import sys
 import threading
 import time
@@ -88,32 +90,42 @@ MQTT_WARN_AFTER = env_int("MQTT_WARN_AFTER", 60)
 # publishes everything.
 MQTT_PUBLISH_FIELDS = {f.strip() for f in env("MQTT_PUBLISH_FIELDS", "").split(",") if f.strip()}
 
-# Smart-meter data is taken from DSMR-reader's own MQTT export (its JSON topics), not from its
-# database or REST API. That needs no DSMR-reader configuration beyond the export already being
-# enabled, avoids coupling to its schema, and reaches us over the broker we're already connected
-# to. Reading the P1 stream directly is not an option: the ser2net endpoint feeding DSMR-reader
-# accepts a single client and answers "Port already in use" to anyone else.
-ENABLE_DSMR = env_bool("ENABLE_DSMR", True)
-DSMR_TOPIC_ELEC = env("DSMR_TOPIC_ELEC", "dsmr/json/elec")
-DSMR_TOPIC_GAS = env("DSMR_TOPIC_GAS", "dsmr/json/gas")
-DSMR_TOPIC_DAY = env("DSMR_TOPIC_DAY", "dsmr/day-consumption")
-DSMR_ELEC_TABLE = env("DSMR_ELEC_TABLE", "electricity")
-DSMR_GAS_TABLE = env("DSMR_GAS_TABLE", "gas_positions")
-DSMR_DAY_TABLE = env("DSMR_DAY_TABLE", "electricity_day_totals")
-# Cached smart-meter values older than this are treated as absent, so a stalled DSMR-reader or
-# broker can't feed stale consumption figures into a PVOutput upload.
-DSMR_MAX_DATA_AGE = env_int("DSMR_MAX_DATA_AGE", 300)
-# If DSMR-reader's mapping includes one of these, its value is used as the point's timestamp
-# instead of our receipt time. Worth enabling `read_at` on the gas topic in particular: gas is only
-# measured every 5 minutes but republished on every telegram, so timestamping by measurement time
-# collapses ~14k duplicate points a day down to ~275 and makes "last reading before midnight"
-# exact. Falls back to receipt time when absent.
-DSMR_TIME_FIELDS = ("timestamp", "read_at")
-# Zigbee2MQTT smart plugs, same broker as DSMR but an unrelated subsystem: submetering a handful
-# of individual circuits rather than the whole house. Unlike DSMR these have no fixed schema
-# across devices -- two common plug models (Aqara
-# lumi.plug.mmeu01, Tuya TS0121) each publish extra device-specific fields (auto_off /
-# led_disabled_night / power_outage_count on the Aqara, indicator_mode on the Tuya) alongside a
+# Smart-meter data (electricity + gas) is read directly off the P1 telegram stream, not via
+# DSMR-reader's MQTT export or database -- DSMR-reader itself keeps running independently (own
+# DB/admin UI) but is no longer a dependency for this container's own ingestion. This reads a
+# plain-TCP relay of the meter's P1 port: a second ser2net `connection:` block pointing at the
+# same serial device DSMR-reader already reads, each on its own port. P1 is receive-only from the
+# meter's side, so two independent readers don't conflict -- confirmed live, both connections read
+# the same telegrams simultaneously with no "port already in use" issue.
+#
+# Raw telegrams carry no day-totals (DSMR-reader computes those from its own history) and no gas
+# flow-rate, so there's no direct equivalent for those two fields -- a deliberate, documented gap:
+# nothing currently reads electricity_day_totals live (see the stack README), and gas flow-rate
+# was never promoted to a fixed column either.
+ENABLE_P1 = env_bool("ENABLE_P1", False)
+P1_HOST = env("P1_HOST")
+P1_PORT = env_int("P1_PORT", 2001)
+ELEC_TABLE = env("ELEC_TABLE", "electricity")
+GAS_TABLE = env("GAS_TABLE", "gas_positions")
+# How long to wait for a telegram before warning the connection looks stalled. DSMR telegrams
+# arrive roughly once a second, so anything on the order of a minute with nothing at all already
+# means something's wrong, not sensor jitter.
+P1_WARN_AFTER = env_int("P1_WARN_AFTER", 60)
+# Minimum spacing between Postgres writes of electricity data. Telegrams arrive roughly once a
+# second, finer than a dashboard needs; the in-memory cache (get_elec_values) still updates on
+# every telegram regardless, so PVOutput and power_flow always see the latest reading even though
+# what's stored is throttled. Matched to SCAN_INTERVAL by default so solar and electricity series
+# share a resolution. 0 disables throttling. Gas isn't covered by this: it only changes every ~5
+# minutes and is deduped on that basis already (see _handle_p1_telegram).
+P1_MIN_INTERVAL = env_int("P1_MIN_INTERVAL", SCAN_INTERVAL)
+# Cached electricity readings older than this are treated as absent, so a stalled P1 connection
+# can't feed stale grid/house figures into a PVOutput upload or power_flow.
+P1_MAX_DATA_AGE = env_int("P1_MAX_DATA_AGE", 300)
+
+# Zigbee2MQTT smart plugs, an unrelated subsystem: submetering a handful of individual circuits
+# rather than the whole house. These have no fixed schema across devices -- two common plug
+# models (Aqara lumi.plug.mmeu01, Tuya TS0121) each publish extra device-specific fields (auto_off
+# / led_disabled_night / power_outage_count on the Aqara, indicator_mode on the Tuya) alongside a
 # common subset. Only that common subset (PLUG_FIELDS below, plus state) is kept, so a plug being
 # swapped for a different model needs no code change.
 ENABLE_PLUGS = env_bool("ENABLE_PLUGS", False)
@@ -122,9 +134,23 @@ ENABLE_PLUGS = env_bool("ENABLE_PLUGS", False)
 PLUG_TOPICS = env("PLUG_TOPICS", "")
 PLUG_TABLE = env("PLUG_TABLE", "smart_plugs")
 PLUG_FIELDS = ("power", "energy", "current", "voltage")
-# Mirrors DSMR_MIN_INTERVAL: these plugs report on every attribute change, multiple times a
-# minute, finer than a dashboard needs.
+# These plugs report on every attribute change, multiple times a minute -- finer than a dashboard
+# needs. 0 disables throttling.
 PLUG_MIN_INTERVAL = env_int("PLUG_MIN_INTERVAL", 5)
+
+# Solar, grid and house power written together as one table, from values held in memory at the
+# same instant -- a live as-of join across independently-polled solar/P1 readings would be more
+# complex and costly than continuing to compute this once, at ingest. Written on *either* side
+# updating (a fresh solar poll, or a fresh P1 telegram), each time using the other side's latest
+# cached value -- the inverter goes fully offline overnight (Modbus stops responding entirely, not
+# just idling at 0), so without this house/grid would flatline right along with it even though the
+# smart meter keeps reporting all night.
+ENABLE_DERIVED = env_bool("ENABLE_DERIVED", True)
+DERIVED_TABLE = env("DERIVED_TABLE", "power_flow")
+# How long a solar poll stays "current" for power_flow purposes. Past this, the inverter is
+# treated as not producing (0 W) rather than reusing an increasingly-stale reading -- comfortably
+# above SCAN_INTERVAL so a single missed poll doesn't trigger it, well below "asleep all night".
+SOLAR_STALE_AFTER = env_int("SOLAR_STALE_AFTER", 120)
 
 
 def parse_plug_topics(raw):
@@ -147,24 +173,6 @@ def parse_plug_topics(raw):
 
 
 PLUG_TOPIC_MAP = parse_plug_topics(PLUG_TOPICS)
-
-# Solar, grid and house power written together as one table, from values held in memory at the
-# same instant -- a live as-of join across independently-polled solar/DSMR readings would be
-# more complex and costly than continuing to compute this once, at ingest. Written on *either*
-# side updating (a fresh solar poll, or a fresh DSMR message), each time using the other side's
-# latest cached value -- the inverter goes fully offline overnight (Modbus stops responding
-# entirely, not just idles at 0), so without this house/grid would flatline right along with it
-# even though the smart meter keeps reporting all night.
-ENABLE_DERIVED = env_bool("ENABLE_DERIVED", True)
-DERIVED_TABLE = env("DERIVED_TABLE", "power_flow")
-# How long a solar poll stays "current" for power_flow purposes. Past this, the inverter is
-# treated as not producing (0 W) rather than reusing an increasingly-stale reading -- comfortably
-# above SCAN_INTERVAL so a single missed poll doesn't trigger it, well below "asleep all night".
-SOLAR_STALE_AFTER = env_int("SOLAR_STALE_AFTER", 120)
-# Minimum spacing between Postgres writes per source. DSMR-reader republishes on every telegram
-# (~6s), which is finer than a dashboard needs; the in-memory cache still updates on every message,
-# so PVOutput and the metrics always see the latest values regardless. 0 disables throttling.
-DSMR_MIN_INTERVAL = env_int("DSMR_MIN_INTERVAL", 5)
 
 ENABLE_PVOUTPUT = env_bool("ENABLE_PVOUTPUT", False)
 PVOUTPUT_API_KEY = env("PVOUTPUT_API_KEY")
@@ -192,11 +200,11 @@ MINDERGAS_API_URL = "https://www.mindergas.nl/api/meter_readings"
 MINDERGAS_HOUR = env_int("MINDERGAS_HOUR", 0)
 MINDERGAS_MINUTE = env_int("MINDERGAS_MINUTE", 5)
 MINDERGAS_RETRY_INTERVAL = env_int("MINDERGAS_RETRY_INTERVAL", 900)
-# Where to read the gas meter position back from. Defaults line up with what this container
-# writes from DSMR_TOPIC_GAS, so they only need changing if DSMR_GAS_TABLE is customised. This
-# one genuinely does read from Postgres rather than the MQTT cache: Mindergas wants the last
-# reading *before local midnight*, which needs timestamped history, not the current value.
-MINDERGAS_GAS_TABLE = env("MINDERGAS_GAS_TABLE", DSMR_GAS_TABLE)
+# Where to read the gas meter position back from. Defaults line up with what p1_reader_loop
+# writes (see GAS_TABLE), so they only need changing if that's customised. This always reads from
+# Postgres, not any in-memory cache: Mindergas wants the last reading *before local midnight*,
+# which needs timestamped history, not the current value.
+MINDERGAS_GAS_TABLE = env("MINDERGAS_GAS_TABLE", GAS_TABLE)
 MINDERGAS_GAS_FIELD = env("MINDERGAS_GAS_FIELD", "delivered")
 
 # Modbus register map for the Sungrow SG5.0RS (device_type_code 0x2606, nominal 5.0 kW) -- a
@@ -273,91 +281,76 @@ SCAN_START_ADDRESS = min(addr for addr, *_ in REGISTERS.values())
 SCAN_END_ADDRESS = max(addr + (1 if dtype in ("U32", "S32") else 0) for addr, dtype, *_ in REGISTERS.values())
 SCAN_COUNT = SCAN_END_ADDRESS - SCAN_START_ADDRESS + 1
 
-# Fixed columns per table, matching the Postgres schema the deploying stack creates
-# (see its timescaledb init SQL). A field not listed here for its table lands in that
-# table's `extra` JSONB column instead of failing the insert -- this is what keeps DSMR/plug
-# ingestion schemaless from this module's perspective (enabling a new DSMR field that
-# DSMR-reader publishes needs no code change here, only a schema/dashboard change once it's
-# actually wanted).
+# Fixed columns per table, matching the Postgres schema the deploying stack creates (see its
+# timescaledb init SQL). A field not listed here for its table lands in that table's `extra`
+# JSONB column instead of failing the insert -- this is what keeps P1/plug ingestion schemaless
+# from this module's perspective (a new OBIS or Zigbee2MQTT field needs no code change here, only
+# a schema/dashboard change once it's actually wanted).
 TABLE_COLUMNS = {
     POSTGRES_TABLE: set(REGISTERS) | {"run_state"},
-    DSMR_ELEC_TABLE: {
+    ELEC_TABLE: {
         "electricity_delivered_1", "electricity_returned_1", "electricity_delivered_2",
         "electricity_returned_2", "electricity_currently_delivered",
         "electricity_currently_returned", "phase_voltage_l1",
     },
-    DSMR_GAS_TABLE: {"delivered"},
-    DSMR_DAY_TABLE: {"electricity_merged", "electricity_returned_merged"},
+    GAS_TABLE: {"delivered"},
     PLUG_TABLE: set(PLUG_FIELDS) | {"state"},
     DERIVED_TABLE: {"solar_w", "grid_w", "house_w"},
 }
 
 
-def _f(source, values, field):
+def _e(elec, field):
     try:
-        return float(values[field])
+        return float(elec[field])
     except (KeyError, TypeError, ValueError) as exc:
-        raise AssertionError(f"DSMR field {field!r} missing or non-numeric in {source} payload") from exc
-
-
-def _elec(d, field):
-    return _f("elec", d["elec"], field)
+        raise AssertionError(f"P1 electricity field {field!r} missing or non-numeric") from exc
 
 
 # Metrics that can be mapped onto PVOutput parameters, each already normalised to the unit
 # PVOutput expects (Wh for energy, W for power) so the mapping never needs scaling syntax.
 #
-# Each entry is (DSMR sources required, function(inverter_values, dsmr_values)). Metrics with an
-# empty tuple come straight from Modbus; the rest read the cached smart-meter payloads that arrive
-# over MQTT, so no Postgres round-trip is involved and they stay usable even if writes are failing.
+# Each entry is (needs_electricity, function(inverter_values, electricity_values)). Metrics that
+# don't need electricity come straight from the Modbus poll and always work; the rest read the
+# cached P1 reading (see get_elec_values), so no Postgres round-trip is involved and they stay
+# usable even if writes are failing. `e` is None (never accessed) when the metric doesn't need it.
 METRICS = {
     # --- inverter only (always available) ---
-    "daily_generation_wh": ((), lambda i, d: round(i["daily_power_yields"] * 1000)),
-    "total_generation_wh": ((), lambda i, d: round(i["total_power_yields"] * 1000)),
-    "generation_w": ((), lambda i, d: i["total_active_power"]),
-    "dc_power_w": ((), lambda i, d: i["total_dc_power"]),
-    "inverter_voltage_v": ((), lambda i, d: i["phase_a_voltage"]),
+    "daily_generation_wh": (False, lambda i, e: round(i["daily_power_yields"] * 1000)),
+    "total_generation_wh": (False, lambda i, e: round(i["total_power_yields"] * 1000)),
+    "generation_w": (False, lambda i, e: i["total_active_power"]),
+    "dc_power_w": (False, lambda i, e: i["total_dc_power"]),
+    "inverter_voltage_v": (False, lambda i, e: i["phase_a_voltage"]),
     # Inverter heatsink temperature, NOT ambient -- runs ~50 C in normal operation, so mapping it
     # to v5 will skew PVOutput's insolation figures. The old SunGather config left it disabled.
-    "inverter_temp_c": ((), lambda i, d: i["internal_temperature"]),
+    "inverter_temp_c": (False, lambda i, e: i["internal_temperature"]),
     # --- from the smart meter (grid side) ---
-    "grid_import_w": (("elec",), lambda i, d: round(_elec(d, "electricity_currently_delivered") * 1000)),
-    "grid_export_w": (("elec",), lambda i, d: round(_elec(d, "electricity_currently_returned") * 1000)),
-    "grid_voltage_v": (("elec",), lambda i, d: _elec(d, "phase_voltage_l1")),
+    "grid_import_w": (True, lambda i, e: round(_e(e, "electricity_currently_delivered") * 1000)),
+    "grid_export_w": (True, lambda i, e: round(_e(e, "electricity_currently_returned") * 1000)),
+    "grid_voltage_v": (True, lambda i, e: _e(e, "phase_voltage_l1")),
     "total_import_wh": (
-        ("elec",),
-        lambda i, d: round((_elec(d, "electricity_delivered_1") + _elec(d, "electricity_delivered_2")) * 1000),
+        True, lambda i, e: round((_e(e, "electricity_delivered_1") + _e(e, "electricity_delivered_2")) * 1000)
     ),
     "total_export_wh": (
-        ("elec",),
-        lambda i, d: round((_elec(d, "electricity_returned_1") + _elec(d, "electricity_returned_2")) * 1000),
+        True, lambda i, e: round((_e(e, "electricity_returned_1") + _e(e, "electricity_returned_2")) * 1000)
     ),
-    "daily_import_wh": (("day",), lambda i, d: round(_f("day", d["day"], "electricity_merged") * 1000)),
-    "daily_export_wh": (("day",), lambda i, d: round(_f("day", d["day"], "electricity_returned_merged") * 1000)),
     # --- derived: what the house actually used (generation + import - export) ---
     "house_power_w": (
-        ("elec",),
-        lambda i, d: round(
+        True,
+        lambda i, e: round(
             i["total_active_power"]
-            + (_elec(d, "electricity_currently_delivered") - _elec(d, "electricity_currently_returned")) * 1000
-        ),
-    ),
-    "daily_house_energy_wh": (
-        ("day",),
-        lambda i, d: round(
-            i["daily_power_yields"] * 1000
-            + _f("day", d["day"], "electricity_merged") * 1000
-            - _f("day", d["day"], "electricity_returned_merged") * 1000
+            + (_e(e, "electricity_currently_delivered") - _e(e, "electricity_currently_returned")) * 1000
         ),
     ),
     "total_house_energy_wh": (
-        ("elec",),
-        lambda i, d: round(
+        True,
+        lambda i, e: round(
             i["total_power_yields"] * 1000
-            + (_elec(d, "electricity_delivered_1") + _elec(d, "electricity_delivered_2")) * 1000
-            - (_elec(d, "electricity_returned_1") + _elec(d, "electricity_returned_2")) * 1000
+            + (_e(e, "electricity_delivered_1") + _e(e, "electricity_delivered_2")) * 1000
+            - (_e(e, "electricity_returned_1") + _e(e, "electricity_returned_2")) * 1000
         ),
     ),
+    # No daily_import_wh/daily_export_wh/daily_house_energy_wh equivalent: raw telegrams carry no
+    # day-totals (see the comment above ENABLE_P1), so there's nothing to compute these from.
 }
 
 # Metrics that are lifetime counters rather than day totals. PVOutput's c1 flag has to agree with
@@ -380,29 +373,33 @@ _state_lock = threading.Lock()
 latest_values = {}
 latest_poll_monotonic = None
 
-# Latest smart-meter payload per source ("elec"/"gas"/"day"), each as (values, monotonic_time).
-_dsmr_lock = threading.Lock()
-dsmr_cache = {}
-# Last (timestamp, values) written per source, so a republished-but-unchanged reading is not
-# rewritten. Postgres would collapse it anyway (ON CONFLICT on the same time+source), but there
-# is no point spending the write.
-_dsmr_last_written = {}
-# Monotonic time of the last Postgres write per source, for DSMR_MIN_INTERVAL throttling.
-_dsmr_last_write_time = {}
+# Latest electricity reading from the P1 telegram stream, as (values, monotonic_time) -- read by
+# build_pvoutput_params/derived_fields, written only by p1_reader_loop's own thread.
+_elec_lock = threading.Lock()
+_elec_cache = None
+# Monotonic time of the last electricity Postgres write, for P1_MIN_INTERVAL throttling. Owned
+# solely by p1_reader_loop's thread -- no lock needed.
+_last_elec_write_time = 0.0
+
+# Last (timestamp, value) gas reading written, so a telegram repeating the same still-current
+# M-Bus capture (every ~1s, between the meter's own ~5-minute gas updates) doesn't get rewritten.
+# Postgres would collapse it anyway (ON CONFLICT on the same time+source), but there's no point
+# spending the write. Owned solely by p1_reader_loop -- no lock needed.
+_last_gas_written = None
 
 # Monotonic time of the last Postgres write per plug label, for PLUG_MIN_INTERVAL throttling.
 _plug_last_write_time = {}
 # Labels already logged once at INFO on first message, so ongoing traffic doesn't repeat it.
 _plug_seen = set()
 
-# Postgres writes for smart-meter data are handed to a worker thread rather than performed inside
-# the MQTT callback. paho dispatches on_message on its network thread, so a blocking write there
-# stops the socket being drained and the broker discards messages for a slow consumer -- measured as
-# 6 of 20 lost with a synchronous write (against the old HTTP-based InfluxDB write path, but the
+# Every Postgres write (solar poll, plug MQTT message, P1 gas reading) is handed to a worker
+# thread rather than performed inline. A blocking write inside the MQTT callback in particular
+# stops the socket being drained and the broker discards messages for a slow consumer -- measured
+# as 6 of 20 lost with a synchronous write (against the old HTTP-based InfluxDB write path, but the
 # same physical constraint applies to any blocking write here). Bounded so a prolonged Postgres
 # outage cannot grow without limit; oldest points are dropped first, since fresh readings matter
 # more than stale ones.
-_write_queue = queue.Queue(maxsize=env_int("DSMR_WRITE_QUEUE_SIZE", 2000))
+_write_queue = queue.Queue(maxsize=env_int("WRITE_QUEUE_SIZE", 2000))
 
 
 def decode_register(words, offset, datatype):
@@ -502,7 +499,7 @@ def write_postgres(values, ts_ns, table=None, source="sungrow"):
     not in TABLE_COLUMNS. ON CONFLICT DO UPDATE mirrors the old InfluxDB write path's semantics:
     writing the same (time, source) again overwrites rather than silently keeping the first
     write, which matters for the rare case of a corrected re-publish at the same measurement
-    timestamp (see DSMR_TIME_FIELDS)."""
+    timestamp."""
     table = table or POSTGRES_TABLE
     known = TABLE_COLUMNS.get(table, set())
     direct = {k: v for k, v in values.items() if k in known}
@@ -554,25 +551,23 @@ def publish_mqtt(mqtt_client, values):
 def build_pvoutput_params(values):
     """Resolves PVOUTPUT_MAPPING into upload parameters.
 
-    Any parameter needing smart-meter data is dropped if that data is missing or stale, so a
-    stopped DSMR-reader degrades this to a generation-only upload instead of losing it or
+    Any parameter needing electricity data is dropped if that data is missing or stale, so a
+    stalled P1 connection degrades this to a generation-only upload instead of losing it or
     reporting figures from hours ago.
     """
-    dsmr_values = get_dsmr_values() if ENABLE_DSMR else {}
-    missing = {m for name in PVOUTPUT_MAPPING.values() for m in METRICS[name][0]} - dsmr_values.keys()
-    if missing:
-        log.warning(
-            "No fresh DSMR %s data; omitting the parameters that need it", "/".join(sorted(missing))
-        )
+    elec = get_elec_values() if ENABLE_P1 else None
+    needs_elec = {name for name in PVOUTPUT_MAPPING.values() if METRICS[name][0]}
+    if needs_elec and elec is None:
+        log.warning("No fresh electricity data from P1; omitting %s", ", ".join(sorted(needs_elec)))
 
     now = datetime.now()
     params = {"d": now.strftime("%Y%m%d"), "t": now.strftime("%H:%M"), "c1": PVOUTPUT_CUMULATIVE_FLAG}
     for param, name in sorted(PVOUTPUT_MAPPING.items()):
-        required, compute = METRICS[name]
-        if any(m not in dsmr_values for m in required):
+        needs, compute = METRICS[name]
+        if needs and elec is None:
             continue
         try:
-            params[param] = compute(values, dsmr_values)
+            params[param] = compute(values, elec)
         except Exception:
             log.exception("Could not compute %s for %s; omitting it", name, param)
     return params
@@ -603,7 +598,7 @@ def push_mindergas():
     # Mirrors DSMR-reader's own exporter (src/dsmr_mindergas/services.py): take the last gas
     # reading strictly before local midnight -- i.e. the previous day's actual final reading --
     # and POST {"date": <that day>, "reading": "<m3>"}. The value is read back out of the
-    # gas_positions table this container itself writes from DSMR_TOPIC_GAS.
+    # gas_positions table p1_reader_loop writes.
     #
     # Timestamps must be timezone-aware: Postgres stores timestamptz as UTC and reads a naive
     # value as the session's local time, so passing naive local time here would be ambiguous.
@@ -614,7 +609,7 @@ def push_mindergas():
     if row is None:
         raise AssertionError(
             f"No gas reading found before {midnight.isoformat()} "
-            f"-- is ENABLE_DSMR on and is the gas topic publishing?"
+            f"-- is ENABLE_P1 on and is the P1 relay reachable?"
         )
 
     _reading_time, reading = row
@@ -635,113 +630,208 @@ def push_mindergas():
     log.info("Pushed to Mindergas: %s", payload)
 
 
-def parse_timestamp_ns(raw):
-    """ISO 8601 string -> epoch nanoseconds, or None if it isn't one.
-
-    A naive value is read as local time, matching how DSMR-reader renders timestamps when its
-    Django timezone is set; Postgres stores timestamptz as UTC, so the offset has to be resolved
-    here rather than left implicit.
-    """
-    if not isinstance(raw, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.astimezone()
-    return int(parsed.timestamp() * 1_000_000_000)
-
-
-def dsmr_topic_map():
-    """Subscribed topic -> (cache key, Postgres table)."""
-    return {
-        DSMR_TOPIC_ELEC: ("elec", DSMR_ELEC_TABLE),
-        DSMR_TOPIC_GAS: ("gas", DSMR_GAS_TABLE),
-        DSMR_TOPIC_DAY: ("day", DSMR_DAY_TABLE),
-    }
-
-
-def get_dsmr_values():
-    """Cached smart-meter payloads, excluding any source that has gone stale."""
-    now = time.monotonic()
-    with _dsmr_lock:
-        return {key: values for key, (values, seen) in dsmr_cache.items() if now - seen <= DSMR_MAX_DATA_AGE}
-
-
 def _on_mqtt_message(client, userdata, message):
-    entry = dsmr_topic_map().get(message.topic)
-    if entry is not None:
-        _handle_dsmr_message(message, entry)
-        return
     plug_label = PLUG_TOPIC_MAP.get(message.topic)
     if plug_label is not None:
         _handle_plug_message(message, plug_label)
 
 
-def _handle_dsmr_message(message, entry):
-    key, table = entry
+def crc16_arc(data):
+    """CRC-16/ARC (poly 0xA001, init 0, no final XOR) -- what DSMR telegrams are checksummed
+    with. A torn or corrupted read must not silently reach Postgres as a plausible-looking gas
+    reading, so every telegram is verified against this before its contents are trusted."""
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc & 0xFFFF
+
+
+# Matches the telegram's final line ("!" + 4 hex CRC digits + CRLF) -- the only place "!" appears
+# in a well-formed telegram, so a plain search for it is unambiguous.
+_TELEGRAM_END_RE = re.compile(rb"!([0-9A-Fa-f]{4})\r\n")
+
+
+def extract_telegram(buffer):
+    """Looks for one complete, CRC-verified telegram at the start of `buffer`.
+
+    Returns (telegram_text, remaining_buffer). telegram_text is None if no complete telegram is
+    available yet, or if one was found but failed its CRC check (logged and discarded either way
+    -- the remaining buffer still advances past it, so a single bad telegram can't wedge the
+    reader waiting for a checksum that already failed). Bytes before the first "/" are dropped: a
+    freshly opened connection can land mid-telegram, and there's nothing useful to keep before a
+    telegram start.
+    """
+    start = buffer.find(b"/")
+    if start == -1:
+        return None, b""
+    buffer = buffer[start:]
+
+    match = _TELEGRAM_END_RE.search(buffer)
+    if not match:
+        return None, buffer
+
+    telegram = buffer[: match.end()]
+    remaining = buffer[match.end() :]
+
+    # The CRC covers everything from "/" through and including "!", excluding the 4 hex digits
+    # and the trailing CRLF.
+    computed = crc16_arc(telegram[: match.start() + 1])
+    declared = int(match.group(1), 16)
+    if computed != declared:
+        log.warning("P1 telegram CRC mismatch (declared %04X, computed %04X); discarding", declared, computed)
+        return None, remaining
+
+    return telegram.decode("ascii", errors="replace"), remaining
+
+
+_OBIS_LINE_RE = re.compile(r"^(\d+-\d+:\d+\.\d+\.\d+)((?:\([^)]*\))+)$")
+_OBIS_GROUP_RE = re.compile(r"\(([^)]*)\)")
+_DSMR_TIMESTAMP_RE = re.compile(r"^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})[SW]$")
+
+# OBIS code -> the electricity column it fills, confirmed against a real captured telegram
+# (standard Dutch DSMR 5.0, single-phase -- no L2/L3 codes to map). Matches DSMR-MQTT.md's field
+# names exactly, so the Postgres schema/derived_fields/PVOutput METRICS need no changes at all,
+# only the ingestion source does.
+_ELEC_OBIS_MAP = {
+    "1-0:1.8.1": "electricity_delivered_1",
+    "1-0:1.8.2": "electricity_delivered_2",
+    "1-0:2.8.1": "electricity_returned_1",
+    "1-0:2.8.2": "electricity_returned_2",
+    "1-0:1.7.0": "electricity_currently_delivered",
+    "1-0:2.7.0": "electricity_currently_returned",
+    "1-0:32.7.0": "phase_voltage_l1",
+}
+
+
+def _parse_dsmr_timestamp(raw):
+    """DSMR's YYMMDDhhmmss+[SW] timestamp -> epoch nanoseconds.
+
+    The S(ummer)/W(inter) DST suffix is deliberately ignored: the container's TZ=Europe/Amsterdam
+    already resolves DST correctly for the calendar date via astimezone(), so re-deriving it from
+    the suffix would be redundant (and telegrams from other regions may not even use S/W the same
+    way).
+    """
+    match = _DSMR_TIMESTAMP_RE.match(raw)
+    if not match:
+        raise ValueError(f"Not a DSMR timestamp: {raw!r}")
+    year, month, day, hour, minute, second = (int(g) for g in match.groups())
+    naive = datetime(2000 + year, month, day, hour, minute, second)
+    return int(naive.astimezone().timestamp() * 1_000_000_000)
+
+
+def _parse_dsmr_number(raw):
+    return float(raw.split("*", 1)[0])
+
+
+def parse_p1_telegram(text):
+    """Parses one CRC-verified telegram into its electricity and (if present) gas readings.
+
+    Returns (electricity_values, electricity_ts_ns, gas_reading_or_None), where gas_reading is
+    (value, ts_ns) using the M-Bus capture time, not the telegram's own timestamp -- the gas
+    meter is only re-sampled every ~5 minutes, so this is what lets _handle_p1_telegram collapse
+    the ~1s-repeated readings between updates into one write per real change (see DSMR-MQTT.md's
+    `read_at` note, which this mirrors for the old MQTT path).
+
+    The gas M-Bus channel isn't fixed -- discovered by scanning for the device-type line
+    (`0-<n>:24.1.0(003)`, device type 003 = gas) the way DSMR-reader itself does, rather than
+    assuming channel 1.
+
+    Raises ValueError if the telegram has no 0-0:1.0.0 timestamp line -- that would mean this
+    isn't a real P1 telegram.
+    """
+    elec = {}
+    elec_ts_ns = None
+    gas_channel = None
+    gas_reading = None
+
+    for line in text.splitlines():
+        match = _OBIS_LINE_RE.match(line.strip())
+        if not match:
+            continue
+        code, groups = match.group(1), _OBIS_GROUP_RE.findall(match.group(2))
+        if not groups:
+            continue
+
+        if code == "0-0:1.0.0":
+            elec_ts_ns = _parse_dsmr_timestamp(groups[0])
+        elif code in _ELEC_OBIS_MAP:
+            elec[_ELEC_OBIS_MAP[code]] = _parse_dsmr_number(groups[0])
+        elif gas_channel is None and code.endswith(":24.1.0") and groups[0] == "003":
+            gas_channel = code.split(":")[0].rsplit("-", 1)[1]
+        elif gas_channel is not None and code == f"0-{gas_channel}:24.2.1" and len(groups) >= 2:
+            gas_reading = (_parse_dsmr_number(groups[1]), _parse_dsmr_timestamp(groups[0]))
+
+    if elec_ts_ns is None:
+        raise ValueError("Telegram has no 0-0:1.0.0 timestamp line")
+    return elec, elec_ts_ns, gas_reading
+
+
+_elec_seen = False
+_gas_seen = False
+
+
+def get_elec_values():
+    """Latest P1 electricity reading, or None if there isn't one yet or it's gone stale."""
+    with _elec_lock:
+        cache = _elec_cache
+    if cache is None:
+        return None
+    values, seen = cache
+    if time.monotonic() - seen > P1_MAX_DATA_AGE:
+        return None
+    return values
+
+
+def _handle_p1_telegram(text):
+    global _elec_cache, _elec_seen, _last_elec_write_time, _last_gas_written, _gas_seen
     try:
-        # DSMR-reader publishes every value as a JSON string, so coerce to float here and drop
-        # anything non-numeric rather than letting it reach Postgres as a value for a
-        # double-precision column.
-        payload = json.loads(message.payload.decode("utf-8"))
-        values, ts_ns = {}, None
-        for field, raw in payload.items():
-            if field in DSMR_TIME_FIELDS and ts_ns is None:
-                ts_ns = parse_timestamp_ns(raw)
-                if ts_ns is not None:
-                    continue  # consumed as the point's time, not stored as a field
-            try:
-                values[field] = float(raw)
-            except (TypeError, ValueError):
-                log.debug("Ignoring non-numeric DSMR field %s=%r on %s", field, raw, message.topic)
-        if not values:
-            return
+        elec, elec_ts_ns, gas_reading = parse_p1_telegram(text)
     except Exception:
-        log.exception("Could not parse DSMR payload on %s", message.topic)
+        log.exception("Could not parse P1 telegram")
         return
 
-    with _dsmr_lock:
-        first = key not in dsmr_cache
-        dsmr_cache[key] = (values, time.monotonic())
-    if first:
-        log.info(
-            "Receiving DSMR %s data on %s: %s (timestamped by %s)",
-            key,
-            message.topic,
-            ", ".join(sorted(values)),
-            "measurement time" if ts_ns is not None else "receipt time",
-        )
+    if elec:
+        if not _elec_seen:
+            _elec_seen = True
+            log.info("Receiving electricity data from P1 telegrams: %s", ", ".join(sorted(elec)))
+        # The cache updates on every telegram regardless of throttling below, so PVOutput and
+        # power_flow always see the latest reading even when what's stored is throttled.
+        with _elec_lock:
+            _elec_cache = (elec, time.monotonic())
 
-    # A reading republished unchanged carries no new information.
-    if ts_ns is not None and _dsmr_last_written.get(key) == (ts_ns, values):
-        return
-    # Throttle per source. Deliberately after the cache update above, so throttling only reduces
-    # what is stored -- never what PVOutput and the metrics can see.
-    now = time.monotonic()
-    if DSMR_MIN_INTERVAL and now - _dsmr_last_write_time.get(key, 0.0) < DSMR_MIN_INTERVAL:
-        return
-    _dsmr_last_write_time[key] = now
-    if ts_ns is not None:
-        _dsmr_last_written[key] = (ts_ns, dict(values))
+        now = time.monotonic()
+        if not P1_MIN_INTERVAL or now - _last_elec_write_time >= P1_MIN_INTERVAL:
+            _last_elec_write_time = now
+            queue_write(elec, elec_ts_ns, ELEC_TABLE, "p1")
 
-    write_ts_ns = ts_ns if ts_ns is not None else time.time_ns()
-    queue_write(values, write_ts_ns, table, "dsmr")
+            # Also refresh power_flow here, not just from the solar poll loop -- the smart meter
+            # keeps reporting all night even when the inverter is asleep and Modbus stops
+            # responding entirely, so this is what keeps house/grid from flatlining along with
+            # solar. Gated by the same throttle as the electricity write above -- it's derived
+            # from the same reading, so there's no point storing it any more often.
+            if ENABLE_DERIVED:
+                try:
+                    queue_write(
+                        derived_fields({"total_active_power": _solar_power_for_derived()}, elec),
+                        elec_ts_ns,
+                        DERIVED_TABLE,
+                        "derived",
+                    )
+                except Exception:
+                    log.exception("Could not compute derived power flow from P1 update")
 
-    # Also refresh power_flow here, not just from the solar poll loop -- the smart meter keeps
-    # reporting all night even when the inverter is asleep and Modbus stops responding entirely,
-    # so this is what keeps house/grid from flatlining along with solar.
-    if key == "elec" and ENABLE_DERIVED:
-        try:
-            queue_write(
-                derived_fields({"total_active_power": _solar_power_for_derived()}, get_dsmr_values()),
-                write_ts_ns,
-                DERIVED_TABLE,
-                "derived",
-            )
-        except Exception:
-            log.exception("Could not compute derived power flow from DSMR update")
+    if gas_reading is not None:
+        value, gas_ts_ns = gas_reading
+        if not _gas_seen:
+            _gas_seen = True
+            log.info("Receiving gas readings from P1 telegrams: delivered=%s m3", value)
+        # The meter re-samples gas only every ~5 minutes but the telegram repeats the same
+        # reading every ~1s in between -- skip the write when nothing has actually moved.
+        if _last_gas_written != (gas_ts_ns, value):
+            _last_gas_written = (gas_ts_ns, value)
+            queue_write({"delivered": value}, gas_ts_ns, GAS_TABLE, "p1")
 
 
 def _handle_plug_message(message, label):
@@ -781,14 +871,10 @@ def _on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
         log.warning("MQTT connection refused: %s", reason_code)
         return
     log.info("MQTT connected to %s:%s", MQTT_HOST, MQTT_PORT)
-    if ENABLE_DSMR:
+    if ENABLE_PLUGS:
         # (Re)subscribe on every connect, so a broker restart doesn't silently leave us deaf.
         # QoS 1: at QoS 0 the broker is free to discard messages for a consumer that is slow to
         # drain its socket, which loses readings outright.
-        for topic in dsmr_topic_map():
-            client.subscribe(topic, qos=1)
-        log.info("Subscribed to DSMR topics: %s", ", ".join(dsmr_topic_map()))
-    if ENABLE_PLUGS:
         for topic in PLUG_TOPIC_MAP:
             client.subscribe(topic, qos=1)
         log.info("Subscribed to plug topics: %s", ", ".join(PLUG_TOPIC_MAP))
@@ -855,19 +941,19 @@ def _solar_power_for_derived():
     return power
 
 
-def derived_fields(values, dsmr_values):
+def derived_fields(values, elec):
     """Power flow at one instant: what the panels produce, what the grid does, what the house uses.
 
     grid_w is signed the way a meter reads: positive drawing from the grid, negative feeding back.
-    Grid and house fields are omitted rather than zeroed when no fresh smart-meter data is cached,
-    so a DSMR outage shows as a gap in Grafana instead of a plausible-looking 0 W.
+    Grid and house fields are omitted rather than zeroed when no fresh electricity data is cached,
+    so a P1 outage shows as a gap in Grafana instead of a plausible-looking 0 W.
     """
     fields = {"solar_w": float(values["total_active_power"])}
-    if "elec" in dsmr_values:
-        imported = METRICS["grid_import_w"][1](values, dsmr_values)
-        exported = METRICS["grid_export_w"][1](values, dsmr_values)
+    if elec:
+        imported = METRICS["grid_import_w"][1](values, elec)
+        exported = METRICS["grid_export_w"][1](values, elec)
         fields["grid_w"] = float(imported - exported)
-        fields["house_w"] = float(METRICS["house_power_w"][1](values, dsmr_values))
+        fields["house_w"] = float(METRICS["house_power_w"][1](values, elec))
     return fields
 
 
@@ -955,6 +1041,57 @@ def mindergas_loop():
         time.sleep(60)
 
 
+def p1_reader_loop():
+    """Connects to the P1 relay (P1_HOST:P1_PORT) and processes telegrams as they arrive,
+    reconnecting with exponential backoff on any failure.
+
+    A fresh connection can land mid-telegram, and a torn read can leave a partial one sitting in
+    the buffer indefinitely -- both are handled by extract_telegram, called in an inner loop that
+    keeps draining `buffer` as long as it's shrinking (a successful parse *or* a discarded
+    CRC-failure both still consume bytes, so this reliably terminates once nothing more can be
+    extracted from what's been received so far).
+    """
+    delay = 1
+    while True:
+        try:
+            with socket.create_connection((P1_HOST, P1_PORT), timeout=10) as sock:
+                sock.settimeout(P1_WARN_AFTER)
+                log.info("Connected to P1 relay at %s:%s", P1_HOST, P1_PORT)
+                delay = 1
+                warned = False
+                buffer = b""
+                while True:
+                    try:
+                        chunk = sock.recv(4096)
+                    except socket.timeout:
+                        if not warned:
+                            log.warning(
+                                "No P1 telegram received in %ss from %s:%s", P1_WARN_AFTER, P1_HOST, P1_PORT
+                            )
+                            warned = True
+                        continue
+                    if not chunk:
+                        raise OSError("P1 relay closed the connection")
+                    warned = False
+                    buffer += chunk
+                    while True:
+                        prev_len = len(buffer)
+                        telegram, buffer = extract_telegram(buffer)
+                        if telegram is not None:
+                            try:
+                                _handle_p1_telegram(telegram)
+                            except Exception:
+                                log.exception("Could not process P1 telegram")
+                        if len(buffer) == prev_len:
+                            break  # no more progress possible until more bytes arrive
+        except Exception:
+            log.warning(
+                "P1 connection to %s:%s failed/dropped, retrying in %ss", P1_HOST, P1_PORT, delay, exc_info=True
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+
+
 def validate_config():
     unknown = MQTT_PUBLISH_FIELDS - set(REGISTERS) - {"run_state"}
     if unknown:
@@ -1000,20 +1137,27 @@ def validate_config():
                 "day-total" if declared else "lifetime",
             )
 
-    needs_dsmr = sorted({m for n in PVOUTPUT_MAPPING.values() for m in METRICS[n][0]})
-    if needs_dsmr and not ENABLE_DSMR:
+    needs_elec = sorted(n for n in PVOUTPUT_MAPPING.values() if METRICS[n][0])
+    if needs_elec and not ENABLE_P1:
         log.error(
-            "PVOutput mapping needs smart-meter data (%s) but ENABLE_DSMR is false",
-            ", ".join(needs_dsmr),
+            "PVOutput mapping needs electricity data (%s) but ENABLE_P1 is false",
+            ", ".join(needs_elec),
         )
         sys.exit(1)
     log.info(
         "PVOutput mapping: %s%s",
         ", ".join(f"{p}={n}" for p, n in sorted(PVOUTPUT_MAPPING.items())) or "(none)",
-        f" | needs smart-meter data from MQTT: {', '.join(needs_dsmr)}" if needs_dsmr else "",
+        f" | needs electricity data from P1: {', '.join(needs_elec)}" if needs_elec else "",
     )
     if ENABLE_MINDERGAS and not MINDERGAS_API_KEY:
         log.error("ENABLE_MINDERGAS is set but MINDERGAS_API_KEY is missing")
+        sys.exit(1)
+    if ENABLE_MINDERGAS and not ENABLE_P1:
+        log.error("ENABLE_MINDERGAS is set but ENABLE_P1 is false -- there's no other gas source")
+        sys.exit(1)
+
+    if ENABLE_P1 and not P1_HOST:
+        log.error("ENABLE_P1 is set but P1_HOST is missing")
         sys.exit(1)
 
     if ENABLE_PLUGS and not PLUG_TOPIC_MAP:
@@ -1023,11 +1167,14 @@ def validate_config():
 
 def main():
     log.info(
-        "Starting energy-monitor: inverter=%s:%s scan_interval=%ss dsmr=%s plugs=%s(%d) pvoutput=%s mindergas=%s",
+        "Starting energy-monitor: inverter=%s:%s scan_interval=%ss p1=%s(%s:%s) plugs=%s(%d) "
+        "pvoutput=%s mindergas=%s",
         INVERTER_HOST,
         INVERTER_PORT,
         SCAN_INTERVAL,
-        ENABLE_DSMR,
+        ENABLE_P1,
+        P1_HOST,
+        P1_PORT,
         ENABLE_PLUGS,
         len(PLUG_TOPIC_MAP),
         ENABLE_PVOUTPUT,
@@ -1044,6 +1191,8 @@ def main():
     threading.Thread(target=pg_writer_loop, daemon=True).start()
     threading.Thread(target=pvoutput_loop, daemon=True).start()
     threading.Thread(target=mindergas_loop, daemon=True).start()
+    if ENABLE_P1:
+        threading.Thread(target=p1_reader_loop, daemon=True).start()
 
     while True:
         cycle_started = time.monotonic()
@@ -1073,7 +1222,7 @@ def main():
             if ENABLE_DERIVED:
                 try:
                     queue_write(
-                        derived_fields(values, get_dsmr_values() if ENABLE_DSMR else {}),
+                        derived_fields(values, get_elec_values() if ENABLE_P1 else None),
                         ts_ns,
                         DERIVED_TABLE,
                         "derived",

@@ -18,16 +18,17 @@ surface at runtime. This file now additionally covers, all without a real broker
     CONFLICT clause, a known column routed into `extra` or vice versa).
   - psycopg + the Postgres read path: app.get_last_gas_reading() likewise, against a fake
     connection that returns a canned row.
-  - DSMR MQTT message handling: app._on_mqtt_message() against real captured DSMR-reader
-    payloads, checking string->float coercion, timestamp-field consumption, throttling and what
-    ends up on the write queue.
   - Smart-plug MQTT message handling: app._on_mqtt_message() against real captured Zigbee2MQTT
     payloads from both plug models on this network (Aqara lumi.plug.mmeu01, Tuya TS0121), checking
     that only the common fields are kept, per-model extras are dropped, and throttling works.
-  - app.parse_timestamp_ns() across the timestamp shapes DSMR-reader actually emits, plus the
-    two "this is not a timestamp" cases that matter (garbage, and a numeric meter reading).
+  - Direct P1 telegram ingestion: app.crc16_arc()/extract_telegram() against a synthetic but
+    correctly-checksummed telegram (built by the test itself, then verified via the same CRC
+    function the app uses), covering framing across split TCP reads and a corrupted-CRC telegram
+    being discarded without wedging the reader. app.parse_p1_telegram() for electricity + gas OBIS
+    extraction, and app._handle_p1_telegram() for what ends up on the write queue (electricity,
+    gas dedup against a repeated M-Bus capture, and the derived power_flow point).
   - The PVOutput metric formulas in app.METRICS, and that build_pvoutput_params() degrades to
-    inverter-only output when no smart-meter data is cached.
+    inverter-only output when no electricity data is cached.
 
 Run with no arguments; exits non-zero on the first failed expectation. Guarded by an overall
 wall-clock timeout so a hang in any check (e.g. a client that doesn't disconnect cleanly) fails
@@ -370,23 +371,93 @@ class _StubMessage:
         self.payload = json.dumps(payload_dict).encode("utf-8")
 
 
-def check_dsmr_mqtt_message(failures):
-    """DSMR MQTT message parsing, using real captured DSMR-reader payloads.
+# A real telegram body (meter XMX5LGBBLB2415154262, matching a captured sample -- standard Dutch
+# DSMR 5.0, single-phase, gas discovered on M-Bus channel 1) with its own correct CRC appended by
+# the test itself via app.crc16_arc(), rather than a hardcoded checksum -- so this exercises the
+# same CRC function the reader trusts in production, not a second, possibly-wrong implementation.
+_P1_TELEGRAM_BODY = (
+    "/XMX5LGBBLB2415154262\r\n"
+    "\r\n"
+    "1-3:0.2.8(50)\r\n"
+    "0-0:1.0.0(260812134420S)\r\n"
+    "1-0:1.8.1(013727.545*kWh)\r\n"
+    "1-0:1.8.2(011228.911*kWh)\r\n"
+    "1-0:2.8.1(005818.379*kWh)\r\n"
+    "1-0:2.8.2(012199.498*kWh)\r\n"
+    "1-0:1.7.0(00.417*kW)\r\n"
+    "1-0:2.7.0(00.000*kW)\r\n"
+    "1-0:32.7.0(235.0*V)\r\n"
+    "0-1:24.1.0(003)\r\n"
+    "0-1:24.2.1(260812134400S)(06573.284*m3)\r\n"
+    "!"
+)
 
-    Exercises app._on_mqtt_message() end to end: JSON-string -> float coercion, the timestamp
-    field (read_at) being consumed rather than stored as a value, per-source throttling, and what
-    lands on the Postgres write queue.
+
+def _p1_telegram_bytes(body=_P1_TELEGRAM_BODY):
+    crc = app.crc16_arc(body.encode("ascii"))
+    return body.encode("ascii") + f"{crc:04X}".encode("ascii") + b"\r\n"
+
+
+def check_p1_telegram_parsing(failures):
+    """Direct P1 telegram ingestion: framing/CRC (app.extract_telegram()), OBIS extraction
+    (app.parse_p1_telegram()), and what app._handle_p1_telegram() does with the result end to end.
     """
     before = len(failures)
-    orig_min_interval = app.DSMR_MIN_INTERVAL
-    app.DSMR_MIN_INTERVAL = 0  # disable throttling so both messages definitely get queued
-    with app._dsmr_lock:
-        orig_cache = dict(app.dsmr_cache)
-        app.dsmr_cache.clear()
-    orig_last_written = dict(app._dsmr_last_written)
-    orig_last_write_time = dict(app._dsmr_last_write_time)
-    app._dsmr_last_written.clear()
-    app._dsmr_last_write_time.clear()
+    full = _p1_telegram_bytes()
+
+    # A complete telegram plus trailing bytes from whatever comes next must be extracted cleanly,
+    # leaving exactly the trailing bytes behind.
+    telegram, remaining = app.extract_telegram(full + b"next-telegram-starts-here")
+    if telegram is None:
+        failures.append("  extract_telegram() did not recognise a complete, valid telegram")
+    if remaining != b"next-telegram-starts-here":
+        failures.append(f"  extract_telegram() remaining buffer: expected trailing bytes only, got {remaining!r}")
+
+    # A telegram split across two TCP reads (landing mid-telegram) must reassemble correctly --
+    # this is the normal case for a freshly opened connection, not an edge case.
+    split_at = 40
+    partial, buf = app.extract_telegram(full[:split_at])
+    if partial is not None:
+        failures.append("  extract_telegram() returned a telegram from an incomplete buffer")
+    reassembled, buf = app.extract_telegram(buf + full[split_at:])
+    if reassembled != telegram:
+        failures.append("  extract_telegram() failed to reassemble a telegram split across two reads")
+
+    # A corrupted CRC must be discarded (logged, not raised) without leaving the reader stuck --
+    # the remaining buffer must still advance past the bad telegram.
+    corrupted = full[:-6] + b"FFFF\r\n"
+    bad_result, bad_remaining = app.extract_telegram(corrupted)
+    if bad_result is not None:
+        failures.append("  extract_telegram() accepted a telegram with a wrong CRC")
+    if bad_remaining != b"":
+        failures.append(f"  extract_telegram() on a bad-CRC telegram: expected empty remainder, got {bad_remaining!r}")
+
+    expected_elec = {
+        "electricity_delivered_1": 13727.545,
+        "electricity_delivered_2": 11228.911,
+        "electricity_returned_1": 5818.379,
+        "electricity_returned_2": 12199.498,
+        "electricity_currently_delivered": 0.417,
+        "electricity_currently_returned": 0.0,
+        "phase_voltage_l1": 235.0,
+    }
+    expected_elec_ts_ns = app._parse_dsmr_timestamp("260812134420S")
+    expected_gas_ts_ns = app._parse_dsmr_timestamp("260812134400S")
+
+    elec, elec_ts_ns, gas = app.parse_p1_telegram(telegram)
+    if elec != expected_elec:
+        failures.append(f"  parse_p1_telegram() electricity: expected {expected_elec}, got {elec}")
+    if elec_ts_ns != expected_elec_ts_ns:
+        failures.append(f"  parse_p1_telegram() electricity timestamp: expected {expected_elec_ts_ns}, got {elec_ts_ns}")
+    if gas != (6573.284, expected_gas_ts_ns):
+        failures.append(f"  parse_p1_telegram() gas: expected (6573.284, {expected_gas_ts_ns}), got {gas}")
+
+    # End to end through _handle_p1_telegram(): electricity + gas both queued, the elec cache
+    # updated, and a power_flow point derived alongside it.
+    orig_elec_cache = app._elec_cache
+    orig_last_gas_written = app._last_gas_written
+    app._elec_cache = None
+    app._last_gas_written = None
     drained = []
     while True:
         try:
@@ -394,37 +465,8 @@ def check_dsmr_mqtt_message(failures):
         except Empty:
             break
 
-    elec_payload = {
-        "electricity_delivered_1": "13658.117",
-        "electricity_returned_1": "5750.043",
-        "electricity_delivered_2": "11190.901",
-        "electricity_returned_2": "12043.452",
-        "electricity_currently_delivered": "0.000",
-        "electricity_currently_returned": "1.644",
-        "phase_voltage_l1": "235.0",
-    }
-    gas_payload = {
-        "read_at": "2026-07-29T11:45:04+02:00",
-        "delivered": "6573.284",
-        "currently_delivered": "0.072",
-    }
-
     try:
-        app._on_mqtt_message(None, None, _StubMessage(app.DSMR_TOPIC_ELEC, elec_payload))
-        app._on_mqtt_message(None, None, _StubMessage(app.DSMR_TOPIC_GAS, gas_payload))
-
-        values = app.get_dsmr_values()
-
-        expected_elec = {k: float(v) for k, v in elec_payload.items()}
-        if values.get("elec") != expected_elec:
-            failures.append(f"  dsmr 'elec' cache: expected {expected_elec}, got {values.get('elec')}")
-
-        expected_gas = {"delivered": 6573.284, "currently_delivered": 0.072}
-        if "read_at" in values.get("gas", {}):
-            failures.append(f"  dsmr 'gas' cache still has 'read_at' as a field: {values.get('gas')}")
-        elif values.get("gas") != expected_gas:
-            failures.append(f"  dsmr 'gas' cache: expected {expected_gas}, got {values.get('gas')}")
-
+        app._handle_p1_telegram(telegram)
         queued = []
         while True:
             try:
@@ -432,50 +474,49 @@ def check_dsmr_mqtt_message(failures):
             except Empty:
                 break
 
-        elec_item = next((it for it in queued if it[2] == app.DSMR_ELEC_TABLE), None)
-        gas_item = next((it for it in queued if it[2] == app.DSMR_GAS_TABLE), None)
+        elec_item = next((it for it in queued if it[2] == app.ELEC_TABLE), None)
+        gas_item = next((it for it in queued if it[2] == app.GAS_TABLE), None)
+        derived_item = next((it for it in queued if it[2] == app.DERIVED_TABLE), None)
 
         if elec_item is None:
-            failures.append(
-                f"  no point enqueued for elec table {app.DSMR_ELEC_TABLE!r}; queued={queued}"
-            )
-        else:
-            elec_values, _elec_ts_ns, _elec_table, elec_source = elec_item
-            if elec_values != expected_elec:
-                failures.append(f"  queued elec point values: expected {expected_elec}, got {elec_values}")
-            if elec_source != "dsmr":
-                failures.append(f"  queued elec point source: expected 'dsmr', got {elec_source!r}")
+            failures.append(f"  no point enqueued for elec table {app.ELEC_TABLE!r}; queued={queued}")
+        elif elec_item[0] != expected_elec or elec_item[3] != "p1":
+            failures.append(f"  queued elec point: expected ({expected_elec}, source='p1'), got {elec_item}")
 
         if gas_item is None:
-            failures.append(
-                f"  no point enqueued for gas table {app.DSMR_GAS_TABLE!r}; queued={queued}"
-            )
-        else:
-            gas_values, gas_ts_ns, _gas_table, gas_source = gas_item
-            expected_gas_ts_ns = int(datetime(2026, 7, 29, 9, 45, 4, tzinfo=timezone.utc).timestamp() * 1_000_000_000)
-            if "read_at" in gas_values:
-                failures.append(f"  queued gas point still has 'read_at' as a field: {gas_values}")
-            elif gas_values != expected_gas:
-                failures.append(f"  queued gas point values: expected {expected_gas}, got {gas_values}")
-            if gas_ts_ns != expected_gas_ts_ns:
-                failures.append(
-                    f"  queued gas point timestamp: expected {expected_gas_ts_ns} "
-                    f"(2026-07-29T09:45:04 UTC), got {gas_ts_ns}"
-                )
-            if gas_source != "dsmr":
-                failures.append(f"  queued gas point source: expected 'dsmr', got {gas_source!r}")
+            failures.append(f"  no point enqueued for gas table {app.GAS_TABLE!r}; queued={queued}")
+        elif gas_item[0] != {"delivered": 6573.284} or gas_item[3] != "p1":
+            failures.append(f"  queued gas point: expected (delivered=6573.284, source='p1'), got {gas_item}")
+
+        if derived_item is None:
+            failures.append(f"  no power_flow point enqueued alongside the electricity update; queued={queued}")
+
+        cached = app.get_elec_values()
+        if cached != expected_elec:
+            failures.append(f"  get_elec_values() after a P1 telegram: expected {expected_elec}, got {cached}")
+
+        # The gas M-Bus capture repeats unchanged in every telegram between the meter's own
+        # ~5-minute updates -- a second identical telegram must not re-queue the same gas point.
+        app._handle_p1_telegram(telegram)
+        requeued_gas = None
+        while True:
+            try:
+                item = app._write_queue.get_nowait()
+            except Empty:
+                break
+            if item[2] == app.GAS_TABLE:
+                requeued_gas = item
+        if requeued_gas is not None:
+            failures.append(f"  an unchanged repeated gas reading was queued again: {requeued_gas}")
 
         if len(failures) == before:
-            print("  dsmr mqtt parsing: elec + gas payloads decoded, timestamped and queued as expected")
+            print(
+                "  P1 telegram parsing: CRC/framing (incl. split reads and a corrupted CRC), "
+                "electricity+gas OBIS extraction, and end-to-end queuing/dedup all as expected"
+            )
     finally:
-        app.DSMR_MIN_INTERVAL = orig_min_interval
-        with app._dsmr_lock:
-            app.dsmr_cache.clear()
-            app.dsmr_cache.update(orig_cache)
-        app._dsmr_last_written.clear()
-        app._dsmr_last_written.update(orig_last_written)
-        app._dsmr_last_write_time.clear()
-        app._dsmr_last_write_time.update(orig_last_write_time)
+        app._elec_cache = orig_elec_cache
+        app._last_gas_written = orig_last_gas_written
         for item in drained:  # put back anything that was queued before this check ran
             app._write_queue.put_nowait(item)
 
@@ -578,38 +619,27 @@ def check_plug_mqtt_message(failures):
             app._write_queue.put_nowait(item)
 
 
-def check_parse_timestamp_ns(failures):
-    """app.parse_timestamp_ns() across the shapes DSMR-reader emits, and the two non-timestamp
-    cases that matter most: garbage, and a numeric meter reading (so a meter value can never be
-    mistaken for a timestamp field)."""
-    expected_ns = int(datetime(2026, 7, 29, 9, 45, 4, tzinfo=timezone.utc).timestamp() * 1_000_000_000)
-    same_instant = {
-        "2026-07-29T11:45:04+02:00": "tz-aware offset",
-        "2026-07-29T09:45:04+00:00": "UTC offset",
-        "2026-07-29T09:45:04Z": "Z suffix",
-    }
-    for raw, label in same_instant.items():
-        got = app.parse_timestamp_ns(raw)
-        if got != expected_ns:
-            failures.append(f"  parse_timestamp_ns({raw!r}) [{label}]: expected {expected_ns}, got {got}")
+def check_dsmr_timestamp_parsing(failures):
+    """app._parse_dsmr_timestamp() on DSMR's YYMMDDhhmmss+[SW] format (both the summer and winter
+    suffix), computed against Python's own local-time resolution for the same calendar date --
+    not a hardcoded epoch value, since the S/W suffix is deliberately ignored in favour of the
+    container's own TZ (see the function's docstring) -- plus rejection of a malformed timestamp.
+    """
+    for raw, label in (("260812134420S", "summer/DST suffix"), ("260101090000W", "winter suffix")):
+        year, month, day, hour, minute, second = 2000 + int(raw[0:2]), int(raw[2:4]), int(raw[4:6]), \
+            int(raw[6:8]), int(raw[8:10]), int(raw[10:12])
+        expected = int(datetime(year, month, day, hour, minute, second).astimezone().timestamp() * 1_000_000_000)
+        got = app._parse_dsmr_timestamp(raw)
+        if got != expected:
+            failures.append(f"  _parse_dsmr_timestamp({raw!r}) [{label}]: expected {expected}, got {got}")
 
-    # Naive local value: parse_timestamp_ns() reads this as local time (matching how DSMR-reader
-    # renders timestamps), so compute the expected value the same way rather than hardcoding a
-    # timezone-dependent number.
-    naive_raw = "2026-07-29T09:45:04"
-    expected_naive_ns = int(datetime.fromisoformat(naive_raw).astimezone().timestamp() * 1_000_000_000)
-    got_naive = app.parse_timestamp_ns(naive_raw)
-    if got_naive != expected_naive_ns:
-        failures.append(
-            f"  parse_timestamp_ns({naive_raw!r}) [naive local]: expected {expected_naive_ns}, got {got_naive}"
-        )
+    try:
+        app._parse_dsmr_timestamp("not-a-timestamp")
+        failures.append("  _parse_dsmr_timestamp('not-a-timestamp') should have raised ValueError")
+    except ValueError:
+        pass
 
-    for bad in ("not-a-date", "6573.284"):
-        got_bad = app.parse_timestamp_ns(bad)
-        if got_bad is not None:
-            failures.append(f"  parse_timestamp_ns({bad!r}): expected None, got {got_bad}")
-
-    print("  parse_timestamp_ns: offset/UTC/Z/naive all resolved; garbage and numeric strings rejected")
+    print("  DSMR timestamp parsing: summer/winter suffix both resolved via local TZ; garbage rejected")
 
 
 def check_log_level(failures):
@@ -652,60 +682,44 @@ def check_log_level(failures):
 
 def check_derived_fields(failures):
     """The power_flow point written on each poll, which exists so Grafana never has to join
-    measurements. Reuses the same inverter/DSMR fixtures as the metric checks below."""
+    measurements. Reuses the same inverter/electricity fixtures as the metric checks below."""
     before = len(failures)
     inverter = {"total_active_power": 2888}
-    dsmr = {
-        "elec": {
-            "electricity_currently_delivered": 0.0,
-            "electricity_currently_returned": 1.644,
-        }
+    elec = {
+        "electricity_currently_delivered": 0.0,
+        "electricity_currently_returned": 1.644,
     }
 
     # solar_w = 2888
     # grid_w  = (0.0 * 1000) - (1.644 * 1000) = -1644   (negative == feeding the grid)
     # house_w = 2888 + (0.0 - 1.644) * 1000  =  1244
-    got = app.derived_fields(inverter, dsmr)
+    got = app.derived_fields(inverter, elec)
     for name, want in (("solar_w", 2888.0), ("grid_w", -1644.0), ("house_w", 1244.0)):
         if got.get(name) != want:
             failures.append(f"  derived {name}: expected {want}, got {got.get(name)!r}")
     if got and not all(isinstance(v, float) for v in got.values()):
         failures.append(f"  derived fields must all be floats, got {got}")
 
-    # Without cached smart-meter data the grid/house fields must be absent, not zero -- a zero
+    # Without cached electricity data the grid/house fields must be absent, not zero -- a zero
     # would render in Grafana as a real "house using nothing" reading.
-    solar_only = app.derived_fields(inverter, {})
+    solar_only = app.derived_fields(inverter, None)
     if set(solar_only) != {"solar_w"}:
-        failures.append(f"  derived fields without DSMR: expected only solar_w, got {sorted(solar_only)}")
+        failures.append(f"  derived fields without electricity: expected only solar_w, got {sorted(solar_only)}")
 
     if len(failures) == before:
-        print("  derived fields: solar/grid/house computed together; omitted (not zeroed) without DSMR")
+        print("  derived fields: solar/grid/house computed together; omitted (not zeroed) without electricity")
 
 
 def check_solar_stale_fallback(failures):
     """The inverter goes fully offline overnight (Modbus stops responding), which used to mean
-    power_flow stopped updating entirely until the next successful poll. Covers both halves of the
-    fix: _solar_power_for_derived() falling back to 0 once the last poll is too old, and a DSMR
-    'elec' message triggering its own power_flow write so house/grid keep updating regardless.
+    power_flow stopped updating entirely until the next successful poll. Covers both halves of
+    the fix: _solar_power_for_derived() falling back to 0 once the last poll is too old, and a P1
+    telegram triggering its own power_flow write so house/grid keep updating regardless (already
+    exercised end to end in check_p1_telegram_parsing -- this just covers the staleness half).
     """
     before = len(failures)
     orig_latest_values = dict(app.latest_values)
     orig_latest_poll_monotonic = app.latest_poll_monotonic
-    orig_min_interval = app.DSMR_MIN_INTERVAL
-    app.DSMR_MIN_INTERVAL = 0
-    with app._dsmr_lock:
-        orig_cache = dict(app.dsmr_cache)
-        app.dsmr_cache.clear()
-    orig_last_written = dict(app._dsmr_last_written)
-    orig_last_write_time = dict(app._dsmr_last_write_time)
-    app._dsmr_last_written.clear()
-    app._dsmr_last_write_time.clear()
-    drained = []
-    while True:
-        try:
-            drained.append(app._write_queue.get_nowait())
-        except Empty:
-            break
 
     try:
         # Fresh poll -> the real value.
@@ -732,56 +746,13 @@ def check_solar_stale_fallback(failures):
         if got != 0.0:
             failures.append(f"  solar power with no poll yet: expected 0.0, got {got!r}")
 
-        # An 'elec' DSMR message should itself queue a power_flow point -- this is what keeps
-        # house/grid updating through the night, independent of the (dead) solar poll loop.
-        elec_payload = {
-            "electricity_currently_delivered": "0.417",
-            "electricity_currently_returned": "0.000",
-        }
-        app._on_mqtt_message(None, None, _StubMessage(app.DSMR_TOPIC_ELEC, elec_payload))
-        queued = []
-        while True:
-            try:
-                queued.append(app._write_queue.get_nowait())
-            except Empty:
-                break
-        derived_item = next((it for it in queued if it[2] == app.DERIVED_TABLE), None)
-        if derived_item is None:
-            failures.append(
-                f"  no power_flow point queued from a DSMR 'elec' message; queued={queued}"
-            )
-        else:
-            derived_values, _ts_ns, _table, derived_source = derived_item
-            if derived_values.get("solar_w") != 0.0:
-                failures.append(
-                    f"  power_flow from DSMR update: expected solar_w=0.0 (no fresh poll), "
-                    f"got {derived_values.get('solar_w')!r}"
-                )
-            if derived_values.get("house_w") != 417.0:
-                failures.append(
-                    f"  power_flow from DSMR update: expected house_w=417.0, "
-                    f"got {derived_values.get('house_w')!r}"
-                )
-            if derived_source != "derived":
-                failures.append(f"  power_flow from DSMR update: expected source 'derived', got {derived_source!r}")
-
         if len(failures) == before:
-            print("  solar staleness fallback: 0 W once stale, and DSMR updates keep power_flow writing on their own")
+            print("  solar staleness fallback: falls back to 0 W once the last poll is too old")
     finally:
         with app._state_lock:
             app.latest_values.clear()
             app.latest_values.update(orig_latest_values)
             app.latest_poll_monotonic = orig_latest_poll_monotonic
-        app.DSMR_MIN_INTERVAL = orig_min_interval
-        with app._dsmr_lock:
-            app.dsmr_cache.clear()
-            app.dsmr_cache.update(orig_cache)
-        app._dsmr_last_written.clear()
-        app._dsmr_last_written.update(orig_last_written)
-        app._dsmr_last_write_time.clear()
-        app._dsmr_last_write_time.update(orig_last_write_time)
-        for item in drained:
-            app._write_queue.put_nowait(item)
 
 
 def check_pvoutput_metrics(failures):
@@ -796,22 +767,20 @@ def check_pvoutput_metrics(failures):
         "phase_a_voltage": 237.8,
         "internal_temperature": 57.1,
     }
-    dsmr = {
-        "elec": {
-            "electricity_currently_delivered": 0.0,
-            "electricity_currently_returned": 1.644,
-            "electricity_delivered_1": 13658.117,
-            "electricity_delivered_2": 11190.901,
-            "electricity_returned_1": 5750.043,
-            "electricity_returned_2": 12043.452,
-            "phase_voltage_l1": 235.0,
-        }
+    elec = {
+        "electricity_currently_delivered": 0.0,
+        "electricity_currently_returned": 1.644,
+        "electricity_delivered_1": 13658.117,
+        "electricity_delivered_2": 11190.901,
+        "electricity_returned_1": 5750.043,
+        "electricity_returned_2": 12043.452,
+        "phase_voltage_l1": 235.0,
     }
 
     # house_power_w = total_active_power + (currently_delivered - currently_returned) * 1000
     #               = 2888 + (0.0 - 1.644) * 1000 = 2888 - 1644 = 1244
     expected_house_power_w = 1244
-    got_house_power_w = app.METRICS["house_power_w"][1](inverter, dsmr)
+    got_house_power_w = app.METRICS["house_power_w"][1](inverter, elec)
     if got_house_power_w != expected_house_power_w:
         failures.append(f"  house_power_w: expected {expected_house_power_w}, got {got_house_power_w}")
 
@@ -821,36 +790,39 @@ def check_pvoutput_metrics(failures):
     #   returned_1+returned_2  =  5750.043 + 12043.452  = 17793.495 -> *1000 = 17793495
     #   total = 26261*1000 + 24849018 - 17793495 = 26261000 + 24849018 - 17793495 = 33316523
     expected_total_house_energy_wh = 33316523
-    got_total_house_energy_wh = app.METRICS["total_house_energy_wh"][1](inverter, dsmr)
+    got_total_house_energy_wh = app.METRICS["total_house_energy_wh"][1](inverter, elec)
     if got_total_house_energy_wh != expected_total_house_energy_wh:
         failures.append(
             f"  total_house_energy_wh: expected {expected_total_house_energy_wh}, got {got_total_house_energy_wh}"
         )
 
-    # build_pvoutput_params() must drop parameters that need smart-meter data when nothing is
+    # build_pvoutput_params() must drop parameters that need electricity data when nothing is
     # cached, rather than erroring out or reporting stale figures.
     orig_mapping = dict(app.PVOUTPUT_MAPPING)
-    with app._dsmr_lock:
-        orig_cache = dict(app.dsmr_cache)
-        app.dsmr_cache.clear()
+    orig_enable_p1 = app.ENABLE_P1
+    orig_elec_cache = app._elec_cache
+    app.ENABLE_P1 = True
+    app._elec_cache = None
     app.PVOUTPUT_MAPPING = {"v1": "daily_generation_wh", "v3": "house_power_w"}
     try:
         params = app.build_pvoutput_params(inverter)
         if "v3" in params:
             failures.append(
-                f"  build_pvoutput_params() included v3 (house_power_w needs DSMR 'elec') with an "
-                f"empty dsmr_cache: {params}"
+                f"  build_pvoutput_params() included v3 (house_power_w needs P1 electricity data) "
+                f"with no cached reading: {params}"
             )
         if "v1" not in params:
             failures.append(f"  build_pvoutput_params() dropped v1 (inverter-only) unexpectedly: {params}")
     finally:
         app.PVOUTPUT_MAPPING = orig_mapping
-        with app._dsmr_lock:
-            app.dsmr_cache.clear()
-            app.dsmr_cache.update(orig_cache)
+        app.ENABLE_P1 = orig_enable_p1
+        app._elec_cache = orig_elec_cache
 
     if len(failures) == before:
-        print("  pvoutput metrics: house_power_w/total_house_energy_wh correct; degrades to inverter-only without DSMR")
+        print(
+            "  pvoutput metrics: house_power_w/total_house_energy_wh correct; "
+            "degrades to inverter-only without P1 electricity data"
+        )
 
 
 def _timeout_handler(signum, frame):
@@ -867,9 +839,9 @@ def main():
     check_mqtt_connect(failures)
     check_postgres_write(failures)
     check_get_last_gas_reading(failures)
-    check_dsmr_mqtt_message(failures)
+    check_p1_telegram_parsing(failures)
     check_plug_mqtt_message(failures)
-    check_parse_timestamp_ns(failures)
+    check_dsmr_timestamp_parsing(failures)
     check_pvoutput_metrics(failures)
     check_derived_fields(failures)
     check_solar_stale_fallback(failures)
@@ -882,8 +854,8 @@ def main():
         print("\n".join(failures), file=sys.stderr)
         return 1
 
-    print("smoke test passed: modbus, mqtt connect, postgres write, postgres read, dsmr parsing, "
-          "plug parsing, timestamps, pvoutput metrics, derived fields, solar staleness fallback, log level")
+    print("smoke test passed: modbus, mqtt connect, postgres write, postgres read, P1 telegram parsing, "
+          "plug parsing, DSMR timestamps, pvoutput metrics, derived fields, solar staleness fallback, log level")
     return 0
 
 

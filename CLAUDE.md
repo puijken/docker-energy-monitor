@@ -99,7 +99,16 @@ Key structures/functions to know before editing:
   shrinking (a successful parse *and* a discarded CRC failure both still consume bytes), which is
   what lets a torn read or a mid-telegram connection start reassemble correctly instead of wedging.
 - `parse_p1_telegram` — OBIS code → electricity fields + optional gas reading. The gas M-Bus
-  channel is discovered per telegram (device-type-003 line), never assumed fixed.
+  channel is discovered per telegram (device-type-003 line), never assumed fixed. `_ELEC_OBIS_MAP`
+  is a hard allowlist: unlisted codes are dropped here, *before* `write_postgres`, so unlike plug
+  data they never reach the `extra` JSONB column and adding one is a code change.
+- `_parse_dsmr_timestamp` — the S/W suffix is load-bearing, not decoration: it maps to `fold`, and
+  it is the only thing separating the two passes of the autumn DST fall-back hour. Getting this
+  wrong doesn't error, it silently overwrites an hour of readings once a year via the write path's
+  `ON CONFLICT`. `smoke_test.py` asserts against real UTC instants for exactly this reason.
+- `P1_SOURCE` — the `source` column value for smart-meter rows, pinned to `"dsmr"` and asserted in
+  `smoke_test.py`. It is a GROUP BY key in the deploying stack's continuous aggregates, so changing
+  it splits history rather than continuing it. Read its comment before touching it.
 - `derived_fields` / `_solar_power_for_derived` — compute `power_flow` (solar/grid/house at one
   instant) from independently-timestamped inverter and P1 electricity readings; a stale inverter
   poll (`SOLAR_STALE_AFTER`) is treated as 0 W (asleep), while a P1 gap omits grid/house rather

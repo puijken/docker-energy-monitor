@@ -16,9 +16,14 @@ for the third-party `bohdans/sungather` image.
   database too — so one place holds generation *and* consumption, with no other project's exporter
   in the path.
 - Writes every reading to TimescaleDB (`solar` table, `source=sungrow`; smart-meter data under
-  `electricity` / `gas_positions` with `source=p1`). Fields not in a table's fixed columns land in
-  an `extra` JSONB column instead of failing the write, so enabling a new OBIS/plug field needs no
-  code change here — see [Smart plugs](#smart-plugs-zigbee2mqtt) for what that keeps schemaless.
+  `electricity` / `gas_positions` with `source=dsmr`). That `source` value names the *meter*, not
+  the program reading it, so it stays put across ingestion-path changes — it is a grouping key in
+  downstream continuous aggregates, and changing it starts a parallel series instead of continuing
+  the existing one. Plug fields not in a table's fixed columns land in an `extra` JSONB column
+  instead of failing the write, so a new plug field needs no code change here — see
+  [Smart plugs](#smart-plugs-zigbee2mqtt). Electricity is *not* schemaless in the same way: OBIS
+  codes are mapped through a fixed allowlist and anything unlisted is dropped at parse time, so a
+  new smart-meter field does need one.
 - Publishes the same values to MQTT, one topic per field under `MQTT_TOPIC_PREFIX`.
 - Optionally pushes a status update to PVOutput on an interval (gated by `ENABLE_PVOUTPUT`,
   default off).

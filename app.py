@@ -117,6 +117,19 @@ P1_HOST = env("P1_HOST")
 P1_PORT = env_int("P1_PORT", 2001)
 ELEC_TABLE = env("ELEC_TABLE", "electricity")
 GAS_TABLE = env("GAS_TABLE", "gas_positions")
+# The `source` column value written for smart-meter rows. Still "dsmr" even though nothing goes
+# through DSMR-reader any more, and deliberately not configurable: `source` identifies the *meter*,
+# not the program that read it.
+#
+# Changing it splits history. It is a GROUP BY key in every electricity/gas continuous aggregate in
+# the deploying stack (see its 002_continuous_aggregates.sql) and a filter in its dashboards, so a
+# new value starts a parallel series at the cutover instant rather than continuing the existing one.
+# Briefly writing "p1" here did exactly that: the day of the switch materialised as two rows per
+# aggregate, panels joining solar_daily to electricity_daily matched both and double-counted that
+# day's solar yield, the monthly rollups rendered the month as two split bars, and the data-gap
+# monitoring panel -- which filters on this column -- went blind to the new series while flagging
+# the switch itself as an outage. Keep it stable across ingestion-path changes.
+P1_SOURCE = "dsmr"
 # How long to wait for a telegram before warning the connection looks stalled. DSMR telegrams
 # arrive roughly once a second, so anything on the order of a minute with nothing at all already
 # means something's wrong, not sensor jitter.
@@ -132,6 +145,11 @@ P1_RELAY_BIND = env("P1_RELAY_BIND", "0.0.0.0")
 P1_RELAY_PORT = env_int("P1_RELAY_PORT", 2000)
 # How long a send to a downstream relay client may block before that client is dropped as dead.
 P1_RELAY_CLIENT_TIMEOUT = env_int("P1_RELAY_CLIENT_TIMEOUT", 5)
+# Backoff for the relay's own listening socket (bind and accept), not for its clients. Fixed rather
+# than exponential: everything it retries past is a transient the operator resolves (a port still
+# held by an outgoing container, exhausted fds), so retrying steadily and logging each attempt is
+# more useful than backing off into silence.
+RELAY_RETRY_INTERVAL = 5
 # Minimum spacing between Postgres writes of electricity data. Telegrams arrive roughly once a
 # second, finer than a dashboard needs; the in-memory cache (get_elec_values) still updates on
 # every telegram regardless, so PVOutput and power_flow always see the latest reading even though
@@ -304,9 +322,15 @@ SCAN_COUNT = SCAN_END_ADDRESS - SCAN_START_ADDRESS + 1
 
 # Fixed columns per table, matching the Postgres schema the deploying stack creates (see its
 # timescaledb init SQL). A field not listed here for its table lands in that table's `extra`
-# JSONB column instead of failing the insert -- this is what keeps P1/plug ingestion schemaless
-# from this module's perspective (a new OBIS or Zigbee2MQTT field needs no code change here, only
-# a schema/dashboard change once it's actually wanted).
+# JSONB column instead of failing the insert, so a new Zigbee2MQTT field needs no code change here
+# -- only a schema/dashboard change once it's actually wanted.
+#
+# Note this does NOT extend to smart-meter fields, despite both going through write_postgres:
+# parse_p1_telegram maps OBIS codes through the fixed _ELEC_OBIS_MAP allowlist and discards
+# everything else before write_postgres ever sees it, so ELEC_TABLE's `extra` is always NULL and a
+# new OBIS code does need a code change. Several real fields are dropped this way today (the active
+# tariff indicator 0-0:96.14.0, current 1-0:31.7.0, the power-failure and voltage sag/swell
+# counters); adding them means extending _ELEC_OBIS_MAP, not just the schema.
 TABLE_COLUMNS = {
     POSTGRES_TABLE: set(REGISTERS) | {"run_state"},
     ELEC_TABLE: {
@@ -709,7 +733,7 @@ def extract_telegram(buffer):
 
 _OBIS_LINE_RE = re.compile(r"^(\d+-\d+:\d+\.\d+\.\d+)((?:\([^)]*\))+)$")
 _OBIS_GROUP_RE = re.compile(r"\(([^)]*)\)")
-_DSMR_TIMESTAMP_RE = re.compile(r"^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})[SW]$")
+_DSMR_TIMESTAMP_RE = re.compile(r"^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})([SW])$")
 
 # OBIS code -> the electricity column it fills, confirmed against a real captured telegram
 # (standard Dutch DSMR 5.0, single-phase -- no L2/L3 codes to map). Matches DSMR-MQTT.md's field
@@ -729,16 +753,24 @@ _ELEC_OBIS_MAP = {
 def _parse_dsmr_timestamp(raw):
     """DSMR's YYMMDDhhmmss+[SW] timestamp -> epoch nanoseconds.
 
-    The S(ummer)/W(inter) DST suffix is deliberately ignored: the container's TZ=Europe/Amsterdam
-    already resolves DST correctly for the calendar date via astimezone(), so re-deriving it from
-    the suffix would be redundant (and telegrams from other regions may not even use S/W the same
-    way).
+    The S(ummer)/W(inter) suffix is what disambiguates the autumn DST fall-back, the one hour a
+    year every local wall-clock time occurs twice: first as CEST (flagged S), then again as CET
+    (flagged W). A naive datetime carries fold=0, so astimezone() resolves that hour to the *first*
+    occurrence unconditionally -- which made the winter pass produce timestamps an hour early,
+    colliding exactly with the summer pass, and write_postgres' ON CONFLICT (time, source) DO
+    UPDATE then silently overwrote an hour of electricity and gas readings once a year. Mapping W
+    to fold=1 selects the second occurrence instead.
+
+    Per PEP 495 fold is ignored for any unambiguous time, so this is a no-op for the whole rest of
+    the year (including the spring-forward gap, whose times a meter never emits) -- verified in
+    smoke_test.py against real epochs rather than against this function's own arithmetic.
     """
     match = _DSMR_TIMESTAMP_RE.match(raw)
     if not match:
         raise ValueError(f"Not a DSMR timestamp: {raw!r}")
-    year, month, day, hour, minute, second = (int(g) for g in match.groups())
-    naive = datetime(2000 + year, month, day, hour, minute, second)
+    year, month, day, hour, minute, second = (int(g) for g in match.groups()[:6])
+    naive = datetime(2000 + year, month, day, hour, minute, second,
+                     fold=1 if match.group(7) == "W" else 0)
     return int(naive.astimezone().timestamp() * 1_000_000_000)
 
 
@@ -825,7 +857,7 @@ def _handle_p1_telegram(text):
         now = time.monotonic()
         if not P1_MIN_INTERVAL or now - _last_elec_write_time >= P1_MIN_INTERVAL:
             _last_elec_write_time = now
-            queue_write(elec, elec_ts_ns, ELEC_TABLE, "p1")
+            queue_write(elec, elec_ts_ns, ELEC_TABLE, P1_SOURCE)
 
             # Also refresh power_flow here, not just from the solar poll loop -- the smart meter
             # keeps reporting all night even when the inverter is asleep and Modbus stops
@@ -852,7 +884,7 @@ def _handle_p1_telegram(text):
         # reading every ~1s in between -- skip the write when nothing has actually moved.
         if _last_gas_written != (gas_ts_ns, value):
             _last_gas_written = (gas_ts_ns, value)
-            queue_write({"delivered": value}, gas_ts_ns, GAS_TABLE, "p1")
+            queue_write({"delivered": value}, gas_ts_ns, GAS_TABLE, P1_SOURCE)
 
 
 def _handle_plug_message(message, label):
@@ -1071,22 +1103,43 @@ def p1_relay_accept_loop():
     _relay_clients -- p1_reader_loop's recv loop is what actually writes to them (see
     _relay_broadcast), this thread only handles new arrivals so a slow/stuck accept() can't
     interfere with ingestion.
+
+    Every step retries rather than raising, because an exception escaping here kills this thread
+    while the process itself stays healthy: the container keeps polling, keeps writing, keeps
+    reporting `Up` to Docker and to Telegraf's container monitoring, and nothing anywhere says the
+    relay is gone -- but whatever reads the telegram stream from it (DSMR-reader) has silently lost
+    its feed, which is the exact failure this relay was built to end. So a bind that loses a race
+    with the outgoing container over :2000 during a recreate retries instead of giving up, and a
+    persistently failing accept() sleeps rather than spinning a core at 100% and emitting one
+    traceback per iteration (fd exhaustion in particular fails instantly and forever).
     """
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((P1_RELAY_BIND, P1_RELAY_PORT))
-    server.listen(5)
+    server = None
+    while server is None:
+        try:
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((P1_RELAY_BIND, P1_RELAY_PORT))
+            server.listen(5)
+        except Exception:
+            server = None
+            log.exception(
+                "Could not bind the P1 relay to %s:%s; retrying in %ss. Anything reading the "
+                "telegram stream from this container gets nothing until this succeeds.",
+                P1_RELAY_BIND, P1_RELAY_PORT, RELAY_RETRY_INTERVAL,
+            )
+            time.sleep(RELAY_RETRY_INTERVAL)
     log.info("P1 relay listening on %s:%s", P1_RELAY_BIND, P1_RELAY_PORT)
     while True:
         try:
             conn, addr = server.accept()
+            conn.settimeout(P1_RELAY_CLIENT_TIMEOUT)
+            with _relay_lock:
+                _relay_clients.add(conn)
+                connected = len(_relay_clients)
+            log.info("P1 relay: new downstream client %s:%s (now %d connected)", addr[0], addr[1], connected)
         except Exception:
-            log.exception("P1 relay accept failed")
-            continue
-        conn.settimeout(P1_RELAY_CLIENT_TIMEOUT)
-        with _relay_lock:
-            _relay_clients.add(conn)
-        log.info("P1 relay: new downstream client %s:%s (now %d connected)", addr[0], addr[1], len(_relay_clients))
+            log.exception("P1 relay accept failed; retrying in %ss", RELAY_RETRY_INTERVAL)
+            time.sleep(RELAY_RETRY_INTERVAL)
 
 
 def _relay_broadcast(chunk):

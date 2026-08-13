@@ -485,13 +485,17 @@ def check_p1_telegram_parsing(failures):
 
         if elec_item is None:
             failures.append(f"  no point enqueued for elec table {app.ELEC_TABLE!r}; queued={queued}")
-        elif elec_item[0] != expected_elec or elec_item[3] != "p1":
-            failures.append(f"  queued elec point: expected ({expected_elec}, source='p1'), got {elec_item}")
+        elif elec_item[0] != expected_elec or elec_item[3] != app.P1_SOURCE:
+            failures.append(
+                f"  queued elec point: expected ({expected_elec}, source={app.P1_SOURCE!r}), got {elec_item}"
+            )
 
         if gas_item is None:
             failures.append(f"  no point enqueued for gas table {app.GAS_TABLE!r}; queued={queued}")
-        elif gas_item[0] != {"delivered": 6573.284} or gas_item[3] != "p1":
-            failures.append(f"  queued gas point: expected (delivered=6573.284, source='p1'), got {gas_item}")
+        elif gas_item[0] != {"delivered": 6573.284} or gas_item[3] != app.P1_SOURCE:
+            failures.append(
+                f"  queued gas point: expected (delivered=6573.284, source={app.P1_SOURCE!r}), got {gas_item}"
+            )
 
         if derived_item is None:
             failures.append(f"  no power_flow point enqueued alongside the electricity update; queued={queued}")
@@ -685,26 +689,98 @@ def check_plug_mqtt_message(failures):
 
 
 def check_dsmr_timestamp_parsing(failures):
-    """app._parse_dsmr_timestamp() on DSMR's YYMMDDhhmmss+[SW] format (both the summer and winter
-    suffix), computed against Python's own local-time resolution for the same calendar date --
-    not a hardcoded epoch value, since the S/W suffix is deliberately ignored in favour of the
-    container's own TZ (see the function's docstring) -- plus rejection of a malformed timestamp.
+    """app._parse_dsmr_timestamp() on DSMR's YYMMDDhhmmss+[SW] format, asserted against the UTC
+    instant each local timestamp must resolve to.
+
+    Every expectation below is written as an explicit UTC wall-clock time, NOT recomputed with the
+    same astimezone() arithmetic the implementation uses. The previous version of this test did the
+    latter, which made it tautological: it mirrored the implementation exactly and therefore passed
+    just as happily while the DST fall-back hour was being silently overwritten once a year.
+
+    Pins TZ to Europe/Amsterdam for the duration rather than trusting the ambient one -- the image
+    sets no TZ (the deploying compose file does), so under CI this process is UTC, where every case
+    below is unambiguous and proves nothing.
     """
-    for raw, label in (("260812134420S", "summer/DST suffix"), ("260101090000W", "winter suffix")):
-        year, month, day, hour, minute, second = 2000 + int(raw[0:2]), int(raw[2:4]), int(raw[4:6]), \
-            int(raw[6:8]), int(raw[8:10]), int(raw[10:12])
-        expected = int(datetime(year, month, day, hour, minute, second).astimezone().timestamp() * 1_000_000_000)
-        got = app._parse_dsmr_timestamp(raw)
-        if got != expected:
-            failures.append(f"  _parse_dsmr_timestamp({raw!r}) [{label}]: expected {expected}, got {got}")
-
+    previous_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "Europe/Amsterdam"
+    time.tzset()
     try:
-        app._parse_dsmr_timestamp("not-a-timestamp")
-        failures.append("  _parse_dsmr_timestamp('not-a-timestamp') should have raised ValueError")
-    except ValueError:
-        pass
+        cases = (
+            # (telegram timestamp, expected UTC instant, what it exercises)
+            ("260812134420S", (2026, 8, 12, 11, 44, 20), "ordinary summer time (CEST, UTC+2)"),
+            ("260101090000W", (2026, 1, 1, 8, 0, 0), "ordinary winter time (CET, UTC+1)"),
+            # 2026-10-25 is the autumn fall-back: 03:00 CEST becomes 02:00 CET, so 02:30 local
+            # happens twice and only the S/W flag separates the two. These two cases are the whole
+            # point of the fix -- with the flag ignored they collapse onto the same instant and the
+            # second silently overwrites the first via ON CONFLICT (time, source).
+            ("261025023000S", (2026, 10, 25, 0, 30, 0), "fall-back hour, first (summer) pass"),
+            ("261025023000W", (2026, 10, 25, 1, 30, 0), "fall-back hour, second (winter) pass"),
+            # Just before the transition, unambiguous, so the W-means-fold=1 mapping must not shift
+            # anything that was already correct.
+            ("261025015959S", (2026, 10, 24, 23, 59, 59), "one second before the fall-back"),
+        )
+        resolved = {}
+        for raw, utc_parts, label in cases:
+            expected = int(datetime(*utc_parts, tzinfo=timezone.utc).timestamp() * 1_000_000_000)
+            got = app._parse_dsmr_timestamp(raw)
+            resolved[raw] = got
+            if got != expected:
+                failures.append(
+                    f"  _parse_dsmr_timestamp({raw!r}) [{label}]: expected {expected} "
+                    f"({datetime(*utc_parts, tzinfo=timezone.utc).isoformat()}), got {got} "
+                    f"({datetime.fromtimestamp(got / 1e9, tz=timezone.utc).isoformat()})"
+                )
 
-    print("  DSMR timestamp parsing: summer/winter suffix both resolved via local TZ; garbage rejected")
+        # Stated separately from the per-case assertions above: this is the actual failure mode
+        # (two distinct readings landing on one primary key), and it should fail loudly as itself
+        # rather than only as two mismatched epochs.
+        if resolved.get("261025023000S") == resolved.get("261025023000W"):
+            failures.append(
+                "  the two passes of the DST fall-back hour resolved to the SAME instant "
+                f"({resolved.get('261025023000S')}) -- ON CONFLICT (time, source) will overwrite "
+                "an hour of readings"
+            )
+
+        try:
+            app._parse_dsmr_timestamp("not-a-timestamp")
+            failures.append("  _parse_dsmr_timestamp('not-a-timestamp') should have raised ValueError")
+        except ValueError:
+            pass
+
+        # The suffix is now load-bearing, so a timestamp missing it must be rejected outright
+        # rather than quietly parsed with a guessed offset.
+        try:
+            app._parse_dsmr_timestamp("260812134420")
+            failures.append("  _parse_dsmr_timestamp() should reject a timestamp with no S/W suffix")
+        except ValueError:
+            pass
+    finally:
+        if previous_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_tz
+        time.tzset()
+
+    print("  DSMR timestamps: summer/winter resolved to real UTC instants; DST fall-back hour "
+          "no longer collides; missing/garbage suffix rejected")
+
+
+def check_smart_meter_source_is_stable(failures):
+    """app.P1_SOURCE must stay 'dsmr'.
+
+    Not a style assertion. `source` is a GROUP BY key in every electricity/gas continuous aggregate
+    in the deploying stack and a filter in its dashboards, so changing this value splits history at
+    the cutover instant instead of continuing it: duplicate daily/monthly rows, panels that join on
+    day double-counting, and the data-gap monitoring panel going blind. That regression already
+    shipped once. This is here to make the next attempt fail in CI instead of on the dashboards.
+    """
+    if app.P1_SOURCE != "dsmr":
+        failures.append(
+            f"  app.P1_SOURCE is {app.P1_SOURCE!r}, expected 'dsmr' -- changing it splits every "
+            "electricity/gas continuous aggregate at the cutover instant; see its comment in app.py"
+        )
+        return
+    print("  smart-meter source label: stable at 'dsmr' (history stays continuous)")
 
 
 def check_log_level(failures):
@@ -908,6 +984,7 @@ def main():
     check_p1_relay_broadcast(failures)
     check_plug_mqtt_message(failures)
     check_dsmr_timestamp_parsing(failures)
+    check_smart_meter_source_is_stable(failures)
     check_pvoutput_metrics(failures)
     check_derived_fields(failures)
     check_solar_stale_fallback(failures)
@@ -921,8 +998,8 @@ def main():
         return 1
 
     print("smoke test passed: modbus, mqtt connect, postgres write, postgres read, P1 telegram parsing, "
-          "P1 relay broadcast, plug parsing, DSMR timestamps, pvoutput metrics, derived fields, "
-          "solar staleness fallback, log level")
+          "P1 relay broadcast, plug parsing, DSMR timestamps (incl. DST fall-back), smart-meter "
+          "source stability, pvoutput metrics, derived fields, solar staleness fallback, log level")
     return 0
 
 

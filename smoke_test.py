@@ -604,16 +604,18 @@ def check_p1_stall_reconnect(failures):
             f"expected at least 2 -- a hung upstream would stall ingestion forever"
         )
 
-    # Point the loop at a closed port so it backs off quietly for the rest of the run instead of
-    # hammering a listener the remaining checks don't want.
-    app.P1_HOST, app.P1_PORT = saved[0], saved[1]
-    server.close()
-    for conn in connections:
-        try:
-            conn.close()
-        except Exception:
-            pass
-    app.P1_WARN_AFTER, app.P1_STALL_TIMEOUT, app.ENABLE_P1_RELAY = saved[2], saved[3], saved[4]
+    # p1_reader_loop runs forever by design and has no stop signal, so this thread outlives the
+    # check. Park it somewhere harmless rather than tearing its world down: closing the server or
+    # repointing the host would send it into a reconnect loop that logs a traceback per attempt,
+    # which lands in CI output looking like a failure (it did -- intermittently, depending on where
+    # the loop was when the check finished).
+    #
+    # Leaving the listener open keeps it connected and idle instead, and the deliberately large
+    # timeouts below mean it won't warn or stall-reconnect within the few seconds the remaining
+    # checks take. P1_WARN_AFTER/P1_STALL_TIMEOUT are read only by this loop, so not restoring their
+    # original values affects nothing else.
+    app.P1_WARN_AFTER, app.P1_STALL_TIMEOUT = 3600, 3600
+    app.ENABLE_P1_RELAY = saved[4]
     app.log.setLevel(previous_level)
 
     if len(failures) == before:

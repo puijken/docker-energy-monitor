@@ -60,7 +60,18 @@ classes, just module-level globals guarded by `_state_lock` (or their own dedica
 - **`p1_reader_loop`** (when `ENABLE_P1=true`) — owns a persistent TCP connection to the P1 relay,
   buffers bytes, calls `extract_telegram` to pull out complete CRC-verified telegrams, and hands
   each to `_handle_p1_telegram`. Reconnects with exponential backoff (1s → 30s) on any failure;
-  logs once (not per-telegram) if nothing arrives for `P1_WARN_AFTER` seconds.
+  logs once (not per-telegram) if nothing arrives for `P1_WARN_AFTER` seconds. **Must be the only
+  direct client of the upstream relay/ser2net** — see the `ENABLE_P1_RELAY` note below and its
+  much longer comment in `app.py` before ever changing this.
+- **`p1_relay_accept_loop`** (when `ENABLE_P1_RELAY=true`) — accepts downstream TCP clients on
+  `P1_RELAY_BIND:P1_RELAY_PORT` and adds each to `_relay_clients`. `p1_reader_loop`'s own recv loop
+  is what actually writes to them (`_relay_broadcast`, called on every chunk read from upstream) —
+  this exists so a second consumer (DSMR-reader) can get the P1 stream from *this* container
+  instead of opening a second connection to ser2net itself, which does not actually grant
+  concurrent access to one serial device despite briefly appearing to (crash-looped DSMR-reader
+  and spiked its CPU in production before this was built — full incident in
+  `DEPLOYMENT.local.md`). A downstream client is dropped+closed if a send to it ever blocks past
+  `P1_RELAY_CLIENT_TIMEOUT`, so a stuck client can't stall this container's own ingestion.
 - **`pvoutput_loop`** — fires on wall-clock-aligned `PVOUTPUT_INTERVAL` boundaries (:00/:05/:10…),
   not a timer from container start, so a restart can't shift upload times.
 - **`mindergas_loop`** — fires once daily at `MINDERGAS_HOUR:MINDERGAS_MINUTE`, retrying within
@@ -69,8 +80,10 @@ classes, just module-level globals guarded by `_state_lock` (or their own dedica
 `_handle_p1_telegram` runs on `p1_reader_loop`'s own thread, which is the *other* trigger for
 `power_flow` writes (see README's "Why power_flow updates from two triggers") — so `_state_lock`
 covers cross-thread reads of `latest_values`/`latest_poll_monotonic` from both the poll loop and
-that thread, and `_elec_lock` covers `_elec_cache` (the cached electricity reading PVOutput/
-`derived_fields` read back via `get_elec_values()`).
+that thread, `_elec_lock` covers `_elec_cache` (the cached electricity reading PVOutput/
+`derived_fields` read back via `get_elec_values()`), and `_relay_lock` covers `_relay_clients`
+(written by `p1_relay_accept_loop` on new connections, read/pruned by `p1_reader_loop`'s
+`_relay_broadcast` calls).
 
 Key structures/functions to know before editing:
 

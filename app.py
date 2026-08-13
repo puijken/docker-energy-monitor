@@ -91,12 +91,22 @@ MQTT_WARN_AFTER = env_int("MQTT_WARN_AFTER", 60)
 MQTT_PUBLISH_FIELDS = {f.strip() for f in env("MQTT_PUBLISH_FIELDS", "").split(",") if f.strip()}
 
 # Smart-meter data (electricity + gas) is read directly off the P1 telegram stream, not via
-# DSMR-reader's MQTT export or database -- DSMR-reader itself keeps running independently (own
-# DB/admin UI) but is no longer a dependency for this container's own ingestion. This reads a
-# plain-TCP relay of the meter's P1 port: a second ser2net `connection:` block pointing at the
-# same serial device DSMR-reader already reads, each on its own port. P1 is receive-only from the
-# meter's side, so two independent readers don't conflict -- confirmed live, both connections read
-# the same telegrams simultaneously with no "port already in use" issue.
+# DSMR-reader's MQTT export or database -- DSMR-reader itself can keep running independently (own
+# DB/admin UI) but is no longer a dependency for this container's own ingestion. P1_HOST/P1_PORT
+# point at a plain-TCP relay of the meter's P1 port (e.g. ser2net).
+#
+# IMPORTANT: this container must be the *only* direct client of that relay/ser2net. Two separate
+# ser2net `connection:` blocks pointed at the same serial device do NOT give two clients real
+# concurrent access, despite briefly appearing to in testing -- ser2net only lets one connection
+# actually hold the device open at a time. A short-lived test connection can coexist with an
+# already-idle-stable one without tripping this, which is what made it look safe; the failure only
+# shows up when one side needs to (re)open the device while the other is already holding it, which
+# a long-lived second client (this container) guarantees will eventually happen. When it did, our
+# connection (established once, never dropped) permanently starved DSMR-reader's periodic
+# reconnects, which crash-looped (CPU spike) and lost telegram capture entirely until ENABLE_P1 was
+# turned back off. If DSMR-reader (or anything else) also needs the P1 stream, point it at this
+# container's own relay instead (ENABLE_P1_RELAY below) -- never at a second ser2net connection
+# block on the same serial device.
 #
 # Raw telegrams carry no day-totals (DSMR-reader computes those from its own history) and no gas
 # flow-rate, so there's no direct equivalent for those two fields -- a deliberate, documented gap:
@@ -111,6 +121,17 @@ GAS_TABLE = env("GAS_TABLE", "gas_positions")
 # arrive roughly once a second, so anything on the order of a minute with nothing at all already
 # means something's wrong, not sensor jitter.
 P1_WARN_AFTER = env_int("P1_WARN_AFTER", 60)
+# Re-serves the raw P1 byte stream to any number of downstream TCP clients (e.g. DSMR-reader),
+# making this container the one and only real client of the upstream relay/ser2net -- see the
+# ENABLE_P1 comment above for why that matters. Each connected client gets every byte this
+# container itself reads, from the moment it connects onward (no replay of what it missed, same as
+# connecting to ser2net directly). A client that stops reading gets a bounded send timeout rather
+# than being allowed to block this container's own ingestion indefinitely.
+ENABLE_P1_RELAY = env_bool("ENABLE_P1_RELAY", False)
+P1_RELAY_BIND = env("P1_RELAY_BIND", "0.0.0.0")
+P1_RELAY_PORT = env_int("P1_RELAY_PORT", 2000)
+# How long a send to a downstream relay client may block before that client is dropped as dead.
+P1_RELAY_CLIENT_TIMEOUT = env_int("P1_RELAY_CLIENT_TIMEOUT", 5)
 # Minimum spacing between Postgres writes of electricity data. Telegrams arrive roughly once a
 # second, finer than a dashboard needs; the in-memory cache (get_elec_values) still updates on
 # every telegram regardless, so PVOutput and power_flow always see the latest reading even though
@@ -1041,6 +1062,60 @@ def mindergas_loop():
         time.sleep(60)
 
 
+_relay_lock = threading.Lock()
+_relay_clients = set()
+
+
+def p1_relay_accept_loop():
+    """Accepts downstream connections on P1_RELAY_BIND:P1_RELAY_PORT and adds each to
+    _relay_clients -- p1_reader_loop's recv loop is what actually writes to them (see
+    _relay_broadcast), this thread only handles new arrivals so a slow/stuck accept() can't
+    interfere with ingestion.
+    """
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((P1_RELAY_BIND, P1_RELAY_PORT))
+    server.listen(5)
+    log.info("P1 relay listening on %s:%s", P1_RELAY_BIND, P1_RELAY_PORT)
+    while True:
+        try:
+            conn, addr = server.accept()
+        except Exception:
+            log.exception("P1 relay accept failed")
+            continue
+        conn.settimeout(P1_RELAY_CLIENT_TIMEOUT)
+        with _relay_lock:
+            _relay_clients.add(conn)
+        log.info("P1 relay: new downstream client %s:%s (now %d connected)", addr[0], addr[1], len(_relay_clients))
+
+
+def _relay_broadcast(chunk):
+    """Writes `chunk` to every connected relay client, dropping any that error or time out.
+
+    Runs on p1_reader_loop's own thread, right after each recv() -- a bounded per-client send
+    timeout (P1_RELAY_CLIENT_TIMEOUT) is what keeps a downstream client that stops reading from
+    blocking this container's own ingestion indefinitely; worst case it costs one timeout's worth
+    of delay per broadcast, then that client is gone.
+    """
+    with _relay_lock:
+        clients = list(_relay_clients)
+    dead = []
+    for conn in clients:
+        try:
+            conn.sendall(chunk)
+        except Exception:
+            dead.append(conn)
+    if dead:
+        with _relay_lock:
+            for conn in dead:
+                _relay_clients.discard(conn)
+        for conn in dead:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def p1_reader_loop():
     """Connects to the P1 relay (P1_HOST:P1_PORT) and processes telegrams as they arrive,
     reconnecting with exponential backoff on any failure.
@@ -1073,6 +1148,8 @@ def p1_reader_loop():
                     if not chunk:
                         raise OSError("P1 relay closed the connection")
                     warned = False
+                    if ENABLE_P1_RELAY:
+                        _relay_broadcast(chunk)
                     buffer += chunk
                     while True:
                         prev_len = len(buffer)
@@ -1144,6 +1221,10 @@ def validate_config():
             ", ".join(needs_elec),
         )
         sys.exit(1)
+
+    if ENABLE_P1_RELAY and not ENABLE_P1:
+        log.error("ENABLE_P1_RELAY is set but ENABLE_P1 is false -- there's no upstream stream to relay")
+        sys.exit(1)
     log.info(
         "PVOutput mapping: %s%s",
         ", ".join(f"{p}={n}" for p, n in sorted(PVOUTPUT_MAPPING.items())) or "(none)",
@@ -1167,14 +1248,17 @@ def validate_config():
 
 def main():
     log.info(
-        "Starting energy-monitor: inverter=%s:%s scan_interval=%ss p1=%s(%s:%s) plugs=%s(%d) "
-        "pvoutput=%s mindergas=%s",
+        "Starting energy-monitor: inverter=%s:%s scan_interval=%ss p1=%s(%s:%s) p1_relay=%s(%s:%s) "
+        "plugs=%s(%d) pvoutput=%s mindergas=%s",
         INVERTER_HOST,
         INVERTER_PORT,
         SCAN_INTERVAL,
         ENABLE_P1,
         P1_HOST,
         P1_PORT,
+        ENABLE_P1_RELAY,
+        P1_RELAY_BIND,
+        P1_RELAY_PORT,
         ENABLE_PLUGS,
         len(PLUG_TOPIC_MAP),
         ENABLE_PVOUTPUT,
@@ -1193,6 +1277,8 @@ def main():
     threading.Thread(target=mindergas_loop, daemon=True).start()
     if ENABLE_P1:
         threading.Thread(target=p1_reader_loop, daemon=True).start()
+    if ENABLE_P1_RELAY:
+        threading.Thread(target=p1_relay_accept_loop, daemon=True).start()
 
     while True:
         cycle_started = time.monotonic()

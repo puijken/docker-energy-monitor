@@ -27,6 +27,11 @@ surface at runtime. This file now additionally covers, all without a real broker
     being discarded without wedging the reader. app.parse_p1_telegram() for electricity + gas OBIS
     extraction, and app._handle_p1_telegram() for what ends up on the write queue (electricity,
     gas dedup against a repeated M-Bus capture, and the derived power_flow point).
+  - The P1 relay (app._relay_broadcast(), ENABLE_P1_RELAY): reaches every connected downstream
+    client, and drops+closes one whose send raises rather than letting that propagate out of the
+    broadcast -- this is what stands in for DSMR-reader (or anything else) getting the P1 stream
+    from this container instead of a second direct connection to ser2net, which does not actually
+    grant concurrent access to one serial device (see the ENABLE_P1 comment in app.py).
   - The PVOutput metric formulas in app.METRICS, and that build_pvoutput_params() degrades to
     inverter-only output when no electricity data is cached.
 
@@ -521,6 +526,66 @@ def check_p1_telegram_parsing(failures):
             app._write_queue.put_nowait(item)
 
 
+class _FakeRelayClient:
+    """Mimics the socket app._relay_broadcast() writes to -- sendall()/close(), nothing else."""
+
+    def __init__(self, fail=False):
+        self.sent = []
+        self.fail = fail
+        self.closed = False
+
+    def sendall(self, data):
+        if self.fail:
+            raise OSError("simulated dead/stuck relay client")
+        self.sent.append(data)
+
+    def close(self):
+        self.closed = True
+
+
+def check_p1_relay_broadcast(failures):
+    """app._relay_broadcast(): the P1 fan-out relay this container runs so DSMR-reader (or
+    anything else) can get the telegram stream from *this* container instead of a second direct
+    connection to ser2net -- see the incident this exists to fix (ENABLE_P1's docstring/comment in
+    app.py): two ser2net connections on one serial device don't actually share it.
+
+    Checks a healthy client receives the bytes, a client whose sendall() raises (dead/stuck) is
+    dropped and closed rather than raising out of the broadcast, and a second broadcast only
+    reaches whichever client is still connected.
+    """
+    before = len(failures)
+    orig_clients = set(app._relay_clients)
+    app._relay_clients.clear()
+
+    healthy = _FakeRelayClient()
+    dead = _FakeRelayClient(fail=True)
+    app._relay_clients.add(healthy)
+    app._relay_clients.add(dead)
+
+    try:
+        app._relay_broadcast(b"/telegram-bytes\r\n")
+
+        if healthy.sent != [b"/telegram-bytes\r\n"]:
+            failures.append(f"  relay broadcast: healthy client got {healthy.sent}, expected the one chunk")
+        if not dead.closed:
+            failures.append("  relay broadcast: a client whose sendall() raised was not closed")
+        if dead in app._relay_clients:
+            failures.append("  relay broadcast: a client whose sendall() raised was not dropped from _relay_clients")
+        if healthy not in app._relay_clients:
+            failures.append("  relay broadcast: the healthy client was dropped even though sendall() succeeded")
+
+        # A second broadcast must only reach the survivor -- the dropped client already closed.
+        app._relay_broadcast(b"more-bytes")
+        if healthy.sent != [b"/telegram-bytes\r\n", b"more-bytes"]:
+            failures.append(f"  relay broadcast: healthy client after 2nd send: {healthy.sent}")
+
+        if len(failures) == before:
+            print("  P1 relay broadcast: reaches connected clients, drops+closes a dead one without raising")
+    finally:
+        app._relay_clients.clear()
+        app._relay_clients.update(orig_clients)
+
+
 def check_plug_mqtt_message(failures):
     """Smart-plug MQTT message parsing, using real captured Zigbee2MQTT payloads.
 
@@ -840,6 +905,7 @@ def main():
     check_postgres_write(failures)
     check_get_last_gas_reading(failures)
     check_p1_telegram_parsing(failures)
+    check_p1_relay_broadcast(failures)
     check_plug_mqtt_message(failures)
     check_dsmr_timestamp_parsing(failures)
     check_pvoutput_metrics(failures)
@@ -855,7 +921,8 @@ def main():
         return 1
 
     print("smoke test passed: modbus, mqtt connect, postgres write, postgres read, P1 telegram parsing, "
-          "plug parsing, DSMR timestamps, pvoutput metrics, derived fields, solar staleness fallback, log level")
+          "P1 relay broadcast, plug parsing, DSMR timestamps, pvoutput metrics, derived fields, "
+          "solar staleness fallback, log level")
     return 0
 
 

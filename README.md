@@ -69,6 +69,9 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `P1_WARN_AFTER` | `60` | Seconds without a telegram before warning the connection looks stalled |
 | `P1_MAX_DATA_AGE` | `300` | Cached electricity values older than this count as absent |
 | `P1_MIN_INTERVAL` | `SCAN_INTERVAL` | Minimum seconds between Postgres writes of electricity data (telegrams arrive roughly once a second); the in-memory cache still updates every telegram regardless, so PVOutput/`power_flow` always see the latest reading |
+| `ENABLE_P1_RELAY` | `false` | Re-serve the P1 stream to downstream TCP clients (e.g. DSMR-reader). **Never share ser2net itself between two long-lived clients — use this instead.** See [Sharing the P1 port](#sharing-the-p1-port-with-something-else-that-also-reads-it). |
+| `P1_RELAY_BIND` / `P1_RELAY_PORT` | `0.0.0.0` / `2000` | Interface/port the relay listens on |
+| `P1_RELAY_CLIENT_TIMEOUT` | `5` | Seconds a send to a downstream relay client may block before it's dropped as dead |
 | `ENABLE_DERIVED` | `true` | Write `power_flow` (solar/grid/house at one instant), combining the latest cached inverter and P1 electricity readings whenever either updates |
 | `DERIVED_TABLE` | `power_flow` | Table written to |
 | `SOLAR_STALE_AFTER` | `120` | Seconds after which a stale inverter poll is treated as "not producing" (0 W) rather than reused, for `power_flow` purposes. See [Why power_flow updates from two triggers](#why-power_flow-updates-from-two-triggers). |
@@ -168,28 +171,54 @@ moved, so this doesn't produce one row per second.
 
 A P1 port classically accepts only one TCP client, which blocks this container from reading it
 directly if something else (DSMR-reader, a display) already has the one connection ser2net
-allows. **The fix is on the serial-to-network bridge, not in this container**: ser2net (4.x+,
-YAML config) can define two independent `connection:` blocks that both point at the same serial
-device, each on its own TCP port —
+allows.
+
+**The tempting-looking fix does not actually work — learned the hard way in production.** ser2net
+(4.x+, YAML config) can define two independent `connection:` blocks that both point at the same
+serial device, each on its own TCP port:
 
 ```yaml
 connection: &con01
     accepter: tcp,2000
-    enable: on
     connector: serialdev,/dev/ttyUSB0,115200n81,local
 
 connection: &con02
     accepter: tcp,2001
-    enable: on
     connector: serialdev,/dev/ttyUSB0,115200n81,local
 ```
 
-— confirmed live: both connections read the same telegrams simultaneously with no "port already
-in use" conflict, since the P1 port is receive-only from the meter's side (nothing ever writes
-back to it, so there's no exclusivity to fight over). The existing client keeps its original
-port; this container gets the new one. A single ser2net `max-connections` setting on one
-connection block is *not* the right knob for this — that key doesn't exist in ser2net's schema;
-two separate connection blocks is the supported pattern.
+A quick test of this looked like it worked: both connections read telegrams simultaneously with
+no "port already in use" conflict. It doesn't hold up under real, sustained use — ser2net only
+lets **one** connection actually hold the underlying device open at a time. A brief test can
+coexist with an already-idle-stable connection without ever tripping this, because neither side
+needs to *reopen* the device during that short window. The failure only shows up when one side
+needs to (re)open the device while the other is already holding it — which a second long-lived
+client is guaranteed to eventually cause. In practice: this container's connection (established
+once, never dropped) permanently starved the other client's periodic reconnects, which then
+crash-looped trying to reopen a device error'ing `Port's device already in use` — a different,
+device-level message from the port-level `Port already in use` the plain single-client limit
+gives — burning CPU on restart churn and losing telegram capture entirely, not just degrading it.
+**Do not use two ser2net connection blocks against the same serial device for two long-lived
+clients.**
+
+**The actual fix: relay from this container instead.** `ENABLE_P1_RELAY` re-serves the raw P1
+byte stream this container reads to any number of downstream TCP clients on its own port —
+`P1_HOST`/`P1_PORT` stays this container's *one* real connection to ser2net (a single, ordinary
+`connection:` block, no sharing tricks needed there at all), and whatever else needs the stream
+(DSMR-reader, a display) connects to `P1_RELAY_BIND:P1_RELAY_PORT` on this container instead of to
+ser2net directly:
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_P1_RELAY` | `false` | Re-serve the P1 stream to downstream TCP clients |
+| `P1_RELAY_BIND` | `0.0.0.0` | Interface to listen on |
+| `P1_RELAY_PORT` | `2000` | Port to listen on (matches DSMR-reader's usual default, so repointing it is often just an IP change) |
+| `P1_RELAY_CLIENT_TIMEOUT` | `5` | Seconds a send to a downstream client may block before it's dropped as dead |
+
+Each connected client gets every byte from the moment it connects onward (no replay of what it
+missed — the same behavior as connecting to ser2net directly). A downstream client that stops
+reading gets a bounded send timeout rather than being allowed to block this container's own
+ingestion indefinitely; it's then dropped and closed, freeing it to reconnect fresh.
 
 ## Why power_flow updates from two triggers
 

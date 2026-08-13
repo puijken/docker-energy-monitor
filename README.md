@@ -72,6 +72,7 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `ELEC_TABLE` | `electricity` | Table for electricity readings |
 | `GAS_TABLE` | `gas_positions` | Table for gas readings |
 | `P1_WARN_AFTER` | `60` | Seconds without a telegram before warning the connection looks stalled |
+| `P1_STALL_TIMEOUT` | `180` | Seconds without a telegram before the connection is torn down and rebuilt, however healthy the socket still looks. `0` disables the reconnect — see [When the connection stalls without dropping](#when-the-connection-stalls-without-dropping) |
 | `P1_MAX_DATA_AGE` | `300` | Cached electricity values older than this count as absent |
 | `P1_MIN_INTERVAL` | `SCAN_INTERVAL` | Minimum seconds between Postgres writes of electricity data (telegrams arrive roughly once a second); the in-memory cache still updates every telegram regardless, so PVOutput/`power_flow` always see the latest reading |
 | `ENABLE_P1_RELAY` | `false` | Re-serve the P1 stream to downstream TCP clients (e.g. DSMR-reader). **Never share ser2net itself between two long-lived clients — use this instead.** See [Sharing the P1 port](#sharing-the-p1-port-with-something-else-that-also-reads-it). |
@@ -171,6 +172,29 @@ moved, so this doesn't produce one row per second.
 - **Gas flow rate.** Only the cumulative `delivered` reading is parsed; a current-flow-rate figure
   would need two readings' timestamps and values, which isn't worth it for a value that changes
   this slowly.
+
+### When the connection stalls without dropping
+
+The reader treats prolonged silence as a dead connection, not as patience. Beyond a certain point
+that is the only correct reading of it: telegrams arrive about once a second, so `P1_STALL_TIMEOUT`
+(default 180s) of *nothing at all* is not jitter.
+
+This exists because the failure is invisible at the socket layer. A relay can hang while holding
+the TCP session open, and a firewall or router reload can quietly drop connection-tracking state
+for the flow — in both cases no `FIN` and no `RST` ever arrive. Since this side only ever reads and
+never writes, nothing forces the stack to discover the problem, and a `recv()` that merely retries
+waits forever. Ingestion stops permanently while the process stays healthy by every measure it
+reports.
+
+TCP keepalive is deliberately *not* the mechanism here. Keepalive proves the peer is alive, which a
+hung relay would go on doing indefinitely while sending nothing. A stall deadline covers both that
+case and a peer that has genuinely vanished, so it replaces keepalive rather than supplementing it.
+
+If `ENABLE_P1_RELAY` is on, this matters twice over: downstream clients are fed from this loop's
+own reads, so a stall that isn't recovered takes their feed down too.
+
+Setting `P1_STALL_TIMEOUT=0` restores the old wait-forever behaviour and logs a warning at startup
+saying so. There is no good reason to.
 
 ### Sharing the P1 port with something else that also reads it
 

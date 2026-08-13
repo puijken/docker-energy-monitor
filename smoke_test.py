@@ -40,8 +40,10 @@ wall-clock timeout so a hang in any check (e.g. a client that doesn't disconnect
 loudly instead of stalling CI.
 """
 import json
+import logging
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -547,6 +549,78 @@ class _FakeRelayClient:
         self.closed = True
 
 
+def check_p1_stall_reconnect(failures):
+    """app.p1_reader_loop() must rebuild a connection that stays open but stops delivering.
+
+    Runs the real loop against a real socket, because the bug this covers was a control-flow
+    decision, not a computation: a recv() timeout used to `continue`, so an upstream that hangs
+    while holding the TCP session open (ser2net wedged, conntrack state dropped -- no FIN, no RST)
+    stalled ingestion permanently behind a single warning. Asserting on anything less than "did it
+    actually open a second connection" would just restate the code.
+
+    The fake upstream accepts and then says nothing at all, which is exactly the failure mode: a
+    connection that is healthy by every measure the socket exposes, and useless.
+    """
+    before = len(failures)
+    saved = (app.P1_HOST, app.P1_PORT, app.P1_WARN_AFTER, app.P1_STALL_TIMEOUT, app.ENABLE_P1_RELAY)
+    # Real seconds, so keep them small -- the loop reconnects after P1_STALL_TIMEOUT plus its
+    # backoff, and the backoff doubles because no data ever arrives to reset it.
+    app.P1_WARN_AFTER, app.P1_STALL_TIMEOUT, app.ENABLE_P1_RELAY = 1, 2, False
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(5)
+    app.P1_HOST, app.P1_PORT = server.getsockname()
+
+    connections = []
+    accepted = threading.Event()
+
+    def accept_loop():
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            connections.append(conn)  # held open and deliberately never written to
+            if len(connections) >= 2:
+                accepted.set()
+
+    # The reconnect path logs a warning with a full traceback, which is correct in production and
+    # pure noise here -- suppressed so a passing run doesn't read like a crashing one.
+    previous_level = app.log.level
+    app.log.setLevel(logging.CRITICAL)
+
+    threading.Thread(target=accept_loop, daemon=True).start()
+    threading.Thread(target=app.p1_reader_loop, daemon=True).start()
+
+    # First connect is immediate; the second needs stall (2s) + backoff (1s). 15s is slack for a
+    # loaded CI runner, not an expected duration.
+    reconnected = accepted.wait(timeout=15)
+    if not reconnected:
+        failures.append(
+            f"  p1_reader_loop() did not reconnect to a silent upstream within 15s "
+            f"(P1_STALL_TIMEOUT={app.P1_STALL_TIMEOUT}s); saw {len(connections)} connection(s), "
+            f"expected at least 2 -- a hung upstream would stall ingestion forever"
+        )
+
+    # Point the loop at a closed port so it backs off quietly for the rest of the run instead of
+    # hammering a listener the remaining checks don't want.
+    app.P1_HOST, app.P1_PORT = saved[0], saved[1]
+    server.close()
+    for conn in connections:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    app.P1_WARN_AFTER, app.P1_STALL_TIMEOUT, app.ENABLE_P1_RELAY = saved[2], saved[3], saved[4]
+    app.log.setLevel(previous_level)
+
+    if len(failures) == before:
+        print(f"  P1 stall reconnect: rebuilt a silent-but-open connection ({len(connections)} "
+              f"connects seen), instead of waiting on it forever")
+
+
 def check_p1_relay_broadcast(failures):
     """app._relay_broadcast(): the P1 fan-out relay this container runs so DSMR-reader (or
     anything else) can get the telegram stream from *this* container instead of a second direct
@@ -982,6 +1056,7 @@ def main():
     check_get_last_gas_reading(failures)
     check_p1_telegram_parsing(failures)
     check_p1_relay_broadcast(failures)
+    check_p1_stall_reconnect(failures)
     check_plug_mqtt_message(failures)
     check_dsmr_timestamp_parsing(failures)
     check_smart_meter_source_is_stable(failures)
@@ -998,8 +1073,9 @@ def main():
         return 1
 
     print("smoke test passed: modbus, mqtt connect, postgres write, postgres read, P1 telegram parsing, "
-          "P1 relay broadcast, plug parsing, DSMR timestamps (incl. DST fall-back), smart-meter "
-          "source stability, pvoutput metrics, derived fields, solar staleness fallback, log level")
+          "P1 relay broadcast, P1 stall reconnect, plug parsing, DSMR timestamps (incl. DST fall-back), "
+          "smart-meter source stability, pvoutput metrics, derived fields, solar staleness fallback, "
+          "log level")
     return 0
 
 

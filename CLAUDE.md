@@ -60,9 +60,15 @@ classes, just module-level globals guarded by `_state_lock` (or their own dedica
 - **`p1_reader_loop`** (when `ENABLE_P1=true`) — owns a persistent TCP connection to the P1 relay,
   buffers bytes, calls `extract_telegram` to pull out complete CRC-verified telegrams, and hands
   each to `_handle_p1_telegram`. Reconnects with exponential backoff (1s → 30s) on any failure;
-  logs once (not per-telegram) if nothing arrives for `P1_WARN_AFTER` seconds. **Must be the only
-  direct client of the upstream relay/ser2net** — see the `ENABLE_P1_RELAY` note below and its
-  much longer comment in `app.py` before ever changing this.
+  logs once (not per-telegram) if nothing arrives for `P1_WARN_AFTER` seconds, and **tears the
+  connection down and rebuilds it after `P1_STALL_TIMEOUT`** of total silence. That last part is
+  load-bearing, not defensive tidying: a `recv()` timeout used to `continue`, so an upstream that
+  hung while holding the session open (no FIN, no RST — and this side never writes, so nothing
+  forces the stack to notice) stalled ingestion permanently behind a single warning. Backoff resets
+  on *data*, not on a successful connect, so a connect-then-silence upstream still backs off.
+  Deliberately not TCP keepalive — that only proves the peer is alive, which a hung relay keeps
+  doing while sending nothing. **Must be the only direct client of the upstream relay/ser2net** —
+  see the `ENABLE_P1_RELAY` note below and its much longer comment in `app.py` before changing this.
 - **`p1_relay_accept_loop`** (when `ENABLE_P1_RELAY=true`) — accepts downstream TCP clients on
   `P1_RELAY_BIND:P1_RELAY_PORT` and adds each to `_relay_clients`. `p1_reader_loop`'s own recv loop
   is what actually writes to them (`_relay_broadcast`, called on every chunk read from upstream) —

@@ -134,6 +134,12 @@ P1_SOURCE = "dsmr"
 # arrive roughly once a second, so anything on the order of a minute with nothing at all already
 # means something's wrong, not sensor jitter.
 P1_WARN_AFTER = env_int("P1_WARN_AFTER", 60)
+# How long total silence may last before the connection is considered dead and rebuilt, however
+# healthy the socket still looks. See p1_reader_loop for why a warning alone was not enough. Set
+# comfortably above P1_WARN_AFTER so a stall is reported before it is acted on, and well above any
+# plausible gap between telegrams -- at ~1/s, three minutes of nothing is not jitter. 0 disables
+# the reconnect and restores the old warn-and-wait-forever behaviour; don't.
+P1_STALL_TIMEOUT = env_int("P1_STALL_TIMEOUT", 180) or float("inf")
 # Re-serves the raw P1 byte stream to any number of downstream TCP clients (e.g. DSMR-reader),
 # making this container the one and only real client of the upstream relay/ser2net -- see the
 # ENABLE_P1 comment above for why that matters. Each connected client gets every byte this
@@ -1171,7 +1177,22 @@ def _relay_broadcast(chunk):
 
 def p1_reader_loop():
     """Connects to the P1 relay (P1_HOST:P1_PORT) and processes telegrams as they arrive,
-    reconnecting with exponential backoff on any failure.
+    reconnecting with exponential backoff on any failure -- including a connection that stays open
+    but stops delivering.
+
+    That last case is the one worth spelling out. A recv() timeout used to mean "keep waiting",
+    which is only right if silence is temporary. It isn't always: ser2net can hang while holding
+    the TCP session open, and a firewall or router reload can drop conntrack state for the flow --
+    in both cases no FIN and no RST ever arrive. Nothing else would notice, because this side only
+    ever reads and never writes, so recv() would block in P1_WARN_AFTER slices forever. Ingestion
+    stopped permanently, behind a *single* warning (the log was suppressed after the first, and only
+    ever reset by data actually arriving, which by definition never happened). With ENABLE_P1_RELAY
+    that takes the downstream consumer's feed down too, since it is fed from this loop's own reads.
+
+    So silence is now bounded: P1_STALL_TIMEOUT without a single byte means the connection is dead
+    regardless of what the socket claims, and it gets torn down and rebuilt. This deliberately
+    replaces TCP keepalive rather than adding to it -- keepalive only proves the *peer* is alive,
+    which is exactly what a hung ser2net would keep doing while sending nothing.
 
     A fresh connection can land mid-telegram, and a torn read can leave a partial one sitting in
     the buffer indefinitely -- both are handled by extract_telegram, called in an inner loop that
@@ -1182,25 +1203,42 @@ def p1_reader_loop():
     delay = 1
     while True:
         try:
+            # Wake up often enough to evaluate the stall deadline even if P1_WARN_AFTER is set
+            # longer than it.
             with socket.create_connection((P1_HOST, P1_PORT), timeout=10) as sock:
-                sock.settimeout(P1_WARN_AFTER)
+                sock.settimeout(min(P1_WARN_AFTER, P1_STALL_TIMEOUT))
                 log.info("Connected to P1 relay at %s:%s", P1_HOST, P1_PORT)
-                delay = 1
                 warned = False
                 buffer = b""
+                last_data = time.monotonic()
                 while True:
                     try:
                         chunk = sock.recv(4096)
                     except socket.timeout:
+                        silent_for = time.monotonic() - last_data
+                        if silent_for >= P1_STALL_TIMEOUT:
+                            # Raise rather than continue: this drops into the reconnect path below,
+                            # which is the only thing that can recover a wedged upstream.
+                            raise OSError(
+                                f"No P1 data for {silent_for:.0f}s (limit {P1_STALL_TIMEOUT}s); "
+                                f"treating the connection as dead and reconnecting"
+                            )
                         if not warned:
                             log.warning(
-                                "No P1 telegram received in %ss from %s:%s", P1_WARN_AFTER, P1_HOST, P1_PORT
+                                "No P1 telegram received in %ss from %s:%s; reconnecting if this "
+                                "reaches %ss", P1_WARN_AFTER, P1_HOST, P1_PORT, P1_STALL_TIMEOUT
                             )
                             warned = True
                         continue
                     if not chunk:
                         raise OSError("P1 relay closed the connection")
+                    last_data = time.monotonic()
                     warned = False
+                    # Reset the backoff on real data, not merely on a successful connect: an
+                    # upstream that accepts the connection and then says nothing is precisely the
+                    # stall above, and resetting on connect would retry it every second forever
+                    # instead of backing off.
+                    delay = 1
                     if ENABLE_P1_RELAY:
                         _relay_broadcast(chunk)
                     buffer += chunk
@@ -1293,6 +1331,18 @@ def validate_config():
     if ENABLE_P1 and not P1_HOST:
         log.error("ENABLE_P1 is set but P1_HOST is missing")
         sys.exit(1)
+
+    if ENABLE_P1 and P1_STALL_TIMEOUT == float("inf"):
+        log.warning(
+            "P1_STALL_TIMEOUT=0 disables the stall reconnect. An upstream that hangs while holding "
+            "the connection open will stop ingestion permanently instead of being rebuilt."
+        )
+    elif ENABLE_P1 and P1_STALL_TIMEOUT <= P1_WARN_AFTER:
+        log.warning(
+            "P1_STALL_TIMEOUT (%ss) is not above P1_WARN_AFTER (%ss), so a stall reconnects before "
+            "it is ever warned about -- the reconnect still works, but the logs won't explain why.",
+            P1_STALL_TIMEOUT, P1_WARN_AFTER,
+        )
 
     if ENABLE_PLUGS and not PLUG_TOPIC_MAP:
         log.error("ENABLE_PLUGS is set but PLUG_TOPICS has no valid entries")

@@ -926,43 +926,82 @@ def check_derived_fields(failures):
 
 
 def check_solar_stale_fallback(failures):
-    """The inverter goes fully offline overnight (Modbus stops responding), which used to mean
-    power_flow stopped updating entirely until the next successful poll. Covers both halves of
-    the fix: _solar_power_for_derived() falling back to 0 once the last poll is too old, and a P1
-    telegram triggering its own power_flow write so house/grid keep updating regardless (already
-    exercised end to end in check_p1_telegram_parsing -- this just covers the staleness half).
+    """A stale solar poll is ambiguous, and _solar_power_for_derived() must resolve it from the
+    state the inverter was last seen in rather than by substituting a fixed 0.
+
+    It used to always substitute 0, justified by the inverter going offline overnight. It doesn't:
+    it stays reachable and reports `Standby` at exactly 0 W all night, so nights never depended on
+    the substitution -- it only ever fired on a genuine poll failure, which is exactly when 0 W is
+    wrong. The last case below is the one that matters: a producing array reported as idle makes an
+    exporting house compute as *negative* consumption.
     """
     before = len(failures)
     orig_latest_values = dict(app.latest_values)
     orig_latest_poll_monotonic = app.latest_poll_monotonic
 
-    try:
-        # Fresh poll -> the real value.
+    def _set(power, run_state, age):
         with app._state_lock:
             app.latest_values.clear()
-            app.latest_values["total_active_power"] = 2500.0
-            app.latest_poll_monotonic = time.monotonic()
+            if power is not None:
+                app.latest_values["total_active_power"] = power
+            if run_state is not None:
+                app.latest_values["run_state"] = run_state
+            app.latest_poll_monotonic = None if age is None else time.monotonic() - age
+
+    try:
+        # Fresh poll -> the real value, whatever the state says.
+        _set(2500.0, "Run", 0)
         got = app._solar_power_for_derived()
         if got != 2500.0:
-            failures.append(f"  solar power with a fresh poll: expected 2500.0, got {got!r}")
+            failures.append(f"  fresh poll: expected 2500.0, got {got!r}")
 
-        # Poll older than SOLAR_STALE_AFTER -> 0, not the stale reading.
-        with app._state_lock:
-            app.latest_poll_monotonic = time.monotonic() - app.SOLAR_STALE_AFTER - 1
-        got = app._solar_power_for_derived()
-        if got != 0.0:
-            failures.append(f"  solar power with a stale poll: expected 0.0, got {got!r}")
+        # Stale, but last seen idle -> a real 0. This is the night/shutdown case, and the only one
+        # in which substituting zero was ever justified.
+        for state in sorted(app.IDLE_RUN_STATES):
+            _set(0.0, state, app.SOLAR_STALE_AFTER + 1)
+            got = app._solar_power_for_derived()
+            if got != 0.0:
+                failures.append(f"  stale poll, last seen {state!r} (idle): expected 0.0, got {got!r}")
 
-        # No poll at all yet (e.g. container just started) -> 0.
-        with app._state_lock:
-            app.latest_values.clear()
-            app.latest_poll_monotonic = None
+        # Stale, but last seen producing -> unknown. Must NOT claim 0.
+        _set(3000.0, "Run", app.SOLAR_STALE_AFTER + 1)
         got = app._solar_power_for_derived()
-        if got != 0.0:
-            failures.append(f"  solar power with no poll yet: expected 0.0, got {got!r}")
+        if got is not None:
+            failures.append(
+                f"  stale poll, last seen producing at 3000 W: expected None (unknown), got {got!r} "
+                "-- reporting a producing array as idle makes house_w go negative"
+            )
+
+        # An unmapped/unknown state is not on the idle list, so it must also decline to guess.
+        _set(3000.0, "Unknown (0x1234)", app.SOLAR_STALE_AFTER + 1)
+        if app._solar_power_for_derived() is not None:
+            failures.append("  stale poll with an unmapped run_state should be None, not 0.0")
+
+        # No poll at all yet (container just started) -> unknown, not zero.
+        _set(None, None, None)
+        got = app._solar_power_for_derived()
+        if got is not None:
+            failures.append(f"  no poll yet: expected None, got {got!r}")
+
+        # And the consequence end to end: an unknown solar reading drops solar_w and house_w but
+        # keeps grid_w, which comes straight off the meter.
+        elec = {"electricity_currently_delivered": 0.0, "electricity_currently_returned": 0.5}
+        flow = app.derived_fields({"total_active_power": None}, elec)
+        if "solar_w" in flow or "house_w" in flow:
+            failures.append(f"  derived_fields with unknown solar should omit solar_w/house_w, got {flow}")
+        elif flow.get("grid_w") != -500.0:
+            failures.append(f"  derived_fields with unknown solar should still report grid_w=-500.0, got {flow}")
+
+        # The old behaviour, for contrast: 0 W here would have produced house_w = -500 W.
+        old = app.derived_fields({"total_active_power": 0.0}, elec)
+        if old.get("house_w") != -500.0:
+            failures.append(
+                f"  sanity check failed: substituting 0 W should still compute house_w=-500.0, got {old}"
+            )
 
         if len(failures) == before:
-            print("  solar staleness fallback: falls back to 0 W once the last poll is too old")
+            print("  solar staleness: resolved from the last run_state -- real 0 when idle, omitted "
+                  "(not zeroed) when it was producing, so house_w can't go negative")
     finally:
         with app._state_lock:
             app.latest_values.clear()

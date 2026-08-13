@@ -116,9 +116,12 @@ Key structures/functions to know before editing:
   `smoke_test.py`. It is a GROUP BY key in the deploying stack's continuous aggregates, so changing
   it splits history rather than continuing it. Read its comment before touching it.
 - `derived_fields` / `_solar_power_for_derived` — compute `power_flow` (solar/grid/house at one
-  instant) from independently-timestamped inverter and P1 electricity readings; a stale inverter
-  poll (`SOLAR_STALE_AFTER`) is treated as 0 W (asleep), while a P1 gap omits grid/house rather
-  than guessing.
+  instant) from independently-timestamped inverter and P1 electricity readings. A stale inverter
+  poll is resolved from its last known `run_state`, NOT by substituting 0: idle (`IDLE_RUN_STATES`)
+  is a real zero, anything else returns None and the caller omits `solar_w`/`house_w`. It used to
+  always substitute 0, justified by the inverter going offline overnight — it doesn't, it reports
+  `Standby` at 0 W around the clock, so that only ever fired on real poll failures and turned
+  `house_w` negative. A P1 gap likewise omits grid/house rather than guessing.
 - `build_pvoutput_params` / `push_pvoutput` — maps `PVOUTPUT_V1`…`V6` metric names to values;
   validates the `PVOUTPUT_CUMULATIVE_FLAG`/lifetime-metric combination at startup (see README's
   PVOutput mapping section before touching this).

@@ -187,15 +187,24 @@ PLUG_MIN_INTERVAL = env_int("PLUG_MIN_INTERVAL", 5)
 # same instant -- a live as-of join across independently-polled solar/P1 readings would be more
 # complex and costly than continuing to compute this once, at ingest. Written on *either* side
 # updating (a fresh solar poll, or a fresh P1 telegram), each time using the other side's latest
-# cached value -- the inverter goes fully offline overnight (Modbus stops responding entirely, not
-# just idling at 0), so without this house/grid would flatline right along with it even though the
-# smart meter keeps reporting all night.
+# cached value, so the P1 side keeps house/grid moving at telegram cadence rather than only once
+# per SCAN_INTERVAL.
 ENABLE_DERIVED = env_bool("ENABLE_DERIVED", True)
 DERIVED_TABLE = env("DERIVED_TABLE", "power_flow")
-# How long a solar poll stays "current" for power_flow purposes. Past this, the inverter is
-# treated as not producing (0 W) rather than reusing an increasingly-stale reading -- comfortably
-# above SCAN_INTERVAL so a single missed poll doesn't trigger it, well below "asleep all night".
+# How long a solar poll stays "current" for power_flow purposes -- comfortably above SCAN_INTERVAL
+# so a single missed poll doesn't trip it. What happens *past* it is decided by IDLE_RUN_STATES
+# below, not by a fixed substitution; see _solar_power_for_derived.
 SOLAR_STALE_AFTER = env_int("SOLAR_STALE_AFTER", 120)
+# Run states in which the inverter is genuinely idle rather than unreachable, used to interpret a
+# stale poll. Confirmed against 30 days of real polling on this model: every state listed here
+# reports exactly 0 W (max, not merely mean), while every "*Run*" state averages ~2 kW.
+#
+# This distinction is the whole point. A stale poll is ambiguous on its own -- it can mean the
+# inverter stopped producing, or that we simply lost contact with one that is producing fine -- and
+# those call for opposite answers. Anything not listed here, including an unmapped state code, is
+# treated as "was producing, or unknown", which is deliberately the side that omits rather than
+# guesses.
+IDLE_RUN_STATES = {"Stop", "Key Stop", "Emergency Stop", "Standby", "Initial Standby", "Fault"}
 
 
 def parse_plug_topics(raw):
@@ -872,12 +881,11 @@ def _handle_p1_telegram(text):
             # from the same reading, so there's no point storing it any more often.
             if ENABLE_DERIVED:
                 try:
-                    queue_write(
-                        derived_fields({"total_active_power": _solar_power_for_derived()}, elec),
-                        elec_ts_ns,
-                        DERIVED_TABLE,
-                        "derived",
-                    )
+                    flow = derived_fields({"total_active_power": _solar_power_for_derived()}, elec)
+                    # Can't be empty in practice (elec is truthy here, so grid_w is always set), but
+                    # a point with no fields at all would be a row of nothing but a timestamp.
+                    if flow:
+                        queue_write(flow, elec_ts_ns, DERIVED_TABLE, "derived")
                 except Exception:
                     log.exception("Could not compute derived power flow from P1 update")
 
@@ -987,32 +995,58 @@ def mqtt_watchdog_loop(mqtt_client):
 
 
 def _solar_power_for_derived():
-    """The inverter's current output for power_flow purposes: the real value if the last poll is
-    still within SOLAR_STALE_AFTER, otherwise 0. Unlike a DSMR outage (unknown, so omitted), a
-    stale solar poll reliably means "asleep, not producing" -- 0 is the correct value, not a
-    guess.
+    """The inverter's current output for power_flow purposes, or None when it genuinely isn't known.
+
+    A fresh poll is used as-is. A *stale* one is ambiguous, and this used to resolve that ambiguity
+    by always substituting 0 W, on the stated grounds that the inverter goes offline overnight so a
+    stale poll must mean "asleep". That premise does not hold on this setup: the inverter stays
+    reachable around the clock and reports `Standby` at exactly 0 W all night, which is real data
+    arriving through the normal path -- 17280 rows/day, full 5-second coverage, verified over two
+    weeks. Nights were never relying on the substitution at all.
+
+    So in practice the substitution only ever fired when a poll genuinely failed, which is precisely
+    when 0 W is wrong. During a daytime Modbus dropout it reported a producing array as idle, and
+    because house = solar + import - export, an exporting house then computed as *negative*
+    consumption -- physically impossible, and silently persisted.
+
+    The state the inverter was last seen in resolves it without guessing: idle (IDLE_RUN_STATES) is
+    a real 0, and anything else means it was producing when contact was lost, so the honest answer
+    is None. Callers omit the field rather than write a number, matching what derived_fields already
+    does for a P1 outage: a gap in Grafana, not a plausible-looking zero.
     """
     with _state_lock:
         age = None if latest_poll_monotonic is None else time.monotonic() - latest_poll_monotonic
         power = latest_values.get("total_active_power")
-    if power is None or age is None or age > SOLAR_STALE_AFTER:
-        return 0.0
-    return power
+        run_state = latest_values.get("run_state")
+    if power is None or age is None:
+        return None  # nothing polled yet this run -- unknown, not zero
+    if age <= SOLAR_STALE_AFTER:
+        return power
+    return 0.0 if run_state in IDLE_RUN_STATES else None
 
 
 def derived_fields(values, elec):
     """Power flow at one instant: what the panels produce, what the grid does, what the house uses.
 
     grid_w is signed the way a meter reads: positive drawing from the grid, negative feeding back.
-    Grid and house fields are omitted rather than zeroed when no fresh electricity data is cached,
-    so a P1 outage shows as a gap in Grafana instead of a plausible-looking 0 W.
+
+    Every field is omitted rather than zeroed when its inputs aren't known, so an outage shows as a
+    gap in Grafana instead of a plausible-looking 0 W. That applies symmetrically to both sides:
+    no fresh electricity data drops grid_w and house_w, and a solar reading of None (see
+    _solar_power_for_derived) drops solar_w and house_w. house_w needs both, so it survives only
+    when both are known -- it is the field that would otherwise absorb the error and turn negative.
+    grid_w comes straight off the meter and is unaffected by anything the inverter is doing.
     """
-    fields = {"solar_w": float(values["total_active_power"])}
+    fields = {}
+    solar = values.get("total_active_power")
+    if solar is not None:
+        fields["solar_w"] = float(solar)
     if elec:
         imported = METRICS["grid_import_w"][1](values, elec)
         exported = METRICS["grid_export_w"][1](values, elec)
         fields["grid_w"] = float(imported - exported)
-        fields["house_w"] = float(METRICS["house_power_w"][1](values, elec))
+        if solar is not None:
+            fields["house_w"] = float(METRICS["house_power_w"][1](values, elec))
     return fields
 
 

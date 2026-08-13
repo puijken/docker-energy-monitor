@@ -80,7 +80,7 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `P1_RELAY_CLIENT_TIMEOUT` | `5` | Seconds a send to a downstream relay client may block before it's dropped as dead |
 | `ENABLE_DERIVED` | `true` | Write `power_flow` (solar/grid/house at one instant), combining the latest cached inverter and P1 electricity readings whenever either updates |
 | `DERIVED_TABLE` | `power_flow` | Table written to |
-| `SOLAR_STALE_AFTER` | `120` | Seconds after which a stale inverter poll is treated as "not producing" (0 W) rather than reused, for `power_flow` purposes. See [Why power_flow updates from two triggers](#why-power_flow-updates-from-two-triggers). |
+| `SOLAR_STALE_AFTER` | `120` | Seconds after which an inverter poll is too old to reuse for `power_flow`. What happens past it depends on the inverter's last known `run_state` — see [What a stale inverter poll means](#what-a-stale-inverter-poll-means). |
 | `ENABLE_PLUGS` | `false` | Subscribe to configured Zigbee2MQTT smart-plug topics for per-circuit submetering. See [Smart plugs](#smart-plugs-zigbee2mqtt). |
 | `PLUG_TOPICS` | *(none)* | Comma-separated `topic=label` pairs, e.g. `zigbee2mqtt/Fridge plug=fridge,zigbee2mqtt/Office plug=office`. The label becomes the `source` column value. |
 | `PLUG_TABLE` | `smart_plugs` | Table written to |
@@ -252,23 +252,42 @@ ingestion indefinitely; it's then dropped and closed, freeing it to reconnect fr
 ## Why power_flow updates from two triggers
 
 `power_flow` (solar/grid/house at one instant) was originally only written from the inverter poll
-loop, using whatever smart-meter reading happened to be cached at that moment. That silently broke
-every night: this inverter goes fully offline overnight (Modbus stops responding entirely, not just
-idling at 0 W), so the poll loop's every attempt raised and nothing got written — not even a "0 W
-solar" point — for as long as the inverter was asleep. The smart meter, meanwhile, keeps reporting
-all night, so `electricity`'s own data never had a gap; only the derived `power_flow` table did,
-and a Grafana chart spanning that gap just drew a straight line across it, which reads as a stuck
-reading rather than a legitimate outage — the actual symptom that first surfaced this.
+loop, using whatever smart-meter reading happened to be cached at that moment. That left the table
+updating only as often as the inverter was polled, even though the smart meter reports far more
+frequently — so a Grafana chart drew long straight segments between points, which reads as a stuck
+reading rather than a coarse one.
 
-Fixed by writing `power_flow` from **either** side updating: the existing poll-loop trigger for
-when the inverter is responding, plus a second trigger from every P1 telegram carrying electricity
-data (`_handle_p1_telegram` in `app.py`), each using the other side's latest cached value. On the
-P1 side, the inverter's contribution comes from `_solar_power_for_derived()`: the last poll's value
-if it's within `SOLAR_STALE_AFTER`, otherwise `0.0` — deliberately zeroed rather than omitted, since
-a stale solar poll here reliably means "asleep, not producing", unlike a P1 outage (genuinely
-unknown, so `derived_fields()` still omits grid/house rather than guessing). During the day, when
-both sides are updating every few seconds, this doubles `power_flow`'s write rate — harmless at
-TimescaleDB's scale, and still just one row per instant either trigger fires.
+Fixed by writing `power_flow` from **either** side updating: the existing poll-loop trigger, plus a
+second trigger from every P1 telegram carrying electricity data (`_handle_p1_telegram` in `app.py`),
+each using the other side's latest cached value. During the day, when both sides are updating every
+few seconds, this doubles `power_flow`'s write rate — harmless at TimescaleDB's scale, and still
+just one row per instant either trigger fires.
+
+### What a stale inverter poll means
+
+On the P1 side the inverter's contribution comes from `_solar_power_for_derived()`, and a poll older
+than `SOLAR_STALE_AFTER` is genuinely ambiguous: it can mean the inverter stopped producing, or that
+contact was lost with one that is producing fine. Those call for opposite answers.
+
+This used to always answer 0 W, on the grounds that a stale poll means "asleep, not producing". That
+reasoning assumed the inverter drops off the network when it stops generating. If yours does not —
+this one stays reachable around the clock and reports `Standby` at exactly 0 W all night — then
+nights never relied on the substitution at all, because that 0 W is real data arriving through the
+normal path. The substitution then only ever fired on a genuine poll failure, which is precisely
+when 0 W is wrong: during a daytime dropout it reports a producing array as idle, and since
+`house = solar + import − export`, an exporting house computes as **negative** consumption.
+
+Resolved from the inverter's own last-known `run_state` instead of guessing:
+
+| Last poll | Last known state | `solar_w` | `house_w` | `grid_w` |
+|---|---|---|---|---|
+| fresh | anything | real value | computed | from the meter |
+| stale | idle (`IDLE_RUN_STATES`) | `0` — a real zero | computed | from the meter |
+| stale | producing, or unmapped | *omitted* | *omitted* | from the meter |
+
+Omitting matches what `derived_fields()` already does for a P1 outage: a gap in Grafana rather than
+a plausible-looking zero. `grid_w` comes straight off the meter, so it stays continuous regardless
+of what the inverter is doing.
 
 ## Smart plugs (Zigbee2MQTT)
 

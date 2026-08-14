@@ -49,14 +49,17 @@ classes, just module-level globals guarded by `_state_lock` (or their own dedica
 
 - **Main thread** — the inverter poll loop (`SCAN_INTERVAL` seconds): connects Modbus, calls
   `poll_inverter`, updates `latest_values`/`latest_poll_monotonic` under the lock, queues a
-  Postgres write, computes `derived_fields` (power_flow), publishes to MQTT. Each sink is wrapped
+  Postgres write, computes `derived_fields` (power_flow), and publishes to MQTT if
+  `ENABLE_MQTT_PUBLISH`. Each sink is wrapped
   in its own `try/except` so a Postgres or MQTT outage can't stop the others.
 - **`pg_writer_loop`** — drains a `queue.Queue` fed by `queue_write()` and performs the actual
   Postgres inserts, so DB latency never stretches the poll cadence.
 - **`mqtt_watchdog_loop`** — the paho-mqtt client runs its own network thread for the pub/sub
   connection; this loop separately reconnects on disconnect (`_on_mqtt_disconnect` sets a flag,
-  this polls it) and resubscribes. MQTT here is plugs-only (`ENABLE_PLUGS`) — smart-meter data
-  doesn't go through the broker at all.
+  this polls it) and resubscribes. Smart-meter data doesn't go through the broker at all. Both
+  directions share this one client, so `MQTT_ENABLED` (= `ENABLE_MQTT_PUBLISH or ENABLE_PLUGS`)
+  decides whether `main()` connects at all — with both off there's no client, no watchdog, and
+  `MQTT_HOST` stops being required.
 - **`p1_reader_loop`** (when `ENABLE_P1=true`) — owns a persistent TCP connection to the P1 relay,
   buffers bytes, calls `extract_telegram` to pull out complete CRC-verified telegrams, and hands
   each to `_handle_p1_telegram`. Reconnects with exponential backoff (1s → 30s) on any failure;

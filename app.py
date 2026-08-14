@@ -79,11 +79,24 @@ POSTGRES_USER = env("POSTGRES_USER", required=True)
 POSTGRES_PASSWORD = env("POSTGRES_PASSWORD", required=True)
 POSTGRES_TABLE = env("POSTGRES_TABLE", "solar")
 
-MQTT_HOST = env("MQTT_HOST", required=True)
+# Not unconditionally required any more: MQTT is only needed if something actually uses it, which
+# validate_config checks (publishing below, or plug ingestion further down). A deployment doing
+# neither shouldn't have to invent a broker address.
+MQTT_HOST = env("MQTT_HOST")
 MQTT_PORT = env_int("MQTT_PORT", 1883)
 MQTT_USERNAME = env("MQTT_USERNAME")
 MQTT_PASSWORD = env("MQTT_PASSWORD")
 MQTT_TOPIC_PREFIX = env("MQTT_TOPIC_PREFIX", "energy/solar").rstrip("/")
+# Re-publish each inverter reading to MQTT, one retained topic per field under MQTT_TOPIC_PREFIX.
+# Purely an outbound copy for other systems to consume -- nothing in this container reads it back,
+# and Postgres is written either way, so turning it off loses no data here.
+#
+# Default on, because that is the long-standing behaviour and someone may have a home-automation
+# flow bound to those topics. Worth checking whether anything still subscribes before leaving it on:
+# publishing to topics nobody reads is invisible waste, and a consumer left pointing at an older
+# exporter's topic is invisible breakage. Note this gates *publishing* only -- plug ingestion
+# (ENABLE_PLUGS) uses the same broker connection and is unaffected.
+ENABLE_MQTT_PUBLISH = env_bool("ENABLE_MQTT_PUBLISH", True)
 # How long to allow for the broker connection before warning, then re-warning, about it.
 MQTT_WARN_AFTER = env_int("MQTT_WARN_AFTER", 60)
 # Comma-separated register names to publish (e.g. "total_active_power,run_state"). Empty/unset
@@ -227,6 +240,12 @@ def parse_plug_topics(raw):
 
 
 PLUG_TOPIC_MAP = parse_plug_topics(PLUG_TOPICS)
+
+# Whether a broker connection is needed at all. Both directions share one client, so this is true if
+# either uses it; when neither does, main() skips connecting and skips the watchdog rather than
+# maintaining a connection nothing sends or receives on (and warning every MQTT_WARN_AFTER about a
+# broker that isn't wanted).
+MQTT_ENABLED = ENABLE_MQTT_PUBLISH or ENABLE_PLUGS
 
 ENABLE_PVOUTPUT = env_bool("ENABLE_PVOUTPUT", False)
 PVOUTPUT_API_KEY = env("PVOUTPUT_API_KEY")
@@ -1295,6 +1314,17 @@ def p1_reader_loop():
 
 
 def validate_config():
+    if MQTT_ENABLED and not MQTT_HOST:
+        log.error(
+            "MQTT_HOST is required when ENABLE_MQTT_PUBLISH or ENABLE_PLUGS is set (publishing=%s, "
+            "plugs=%s)", ENABLE_MQTT_PUBLISH, ENABLE_PLUGS,
+        )
+        sys.exit(1)
+    if not MQTT_ENABLED:
+        log.info("MQTT disabled entirely (no publishing, no plug ingestion) -- not connecting to a broker")
+    if MQTT_PUBLISH_FIELDS and not ENABLE_MQTT_PUBLISH:
+        log.warning("MQTT_PUBLISH_FIELDS is set but ENABLE_MQTT_PUBLISH is false, so nothing is published")
+
     unknown = MQTT_PUBLISH_FIELDS - set(REGISTERS) - {"run_state"}
     if unknown:
         log.warning(
@@ -1386,7 +1416,7 @@ def validate_config():
 def main():
     log.info(
         "Starting energy-monitor: inverter=%s:%s scan_interval=%ss p1=%s(%s:%s) p1_relay=%s(%s:%s) "
-        "plugs=%s(%d) pvoutput=%s mindergas=%s",
+        "mqtt_publish=%s plugs=%s(%d) pvoutput=%s mindergas=%s",
         INVERTER_HOST,
         INVERTER_PORT,
         SCAN_INTERVAL,
@@ -1396,6 +1426,7 @@ def main():
         ENABLE_P1_RELAY,
         P1_RELAY_BIND,
         P1_RELAY_PORT,
+        ENABLE_MQTT_PUBLISH,
         ENABLE_PLUGS,
         len(PLUG_TOPIC_MAP),
         ENABLE_PVOUTPUT,
@@ -1406,9 +1437,12 @@ def main():
     global latest_poll_monotonic
 
     modbus_client = ModbusTcpClient(INVERTER_HOST, port=INVERTER_PORT, timeout=10)
-    mqtt_client = mqtt_connect()
+    # Skip the broker entirely when nothing publishes to it and nothing subscribes through it,
+    # rather than holding a connection the watchdog would then warn about every MQTT_WARN_AFTER.
+    mqtt_client = mqtt_connect() if MQTT_ENABLED else None
 
-    threading.Thread(target=mqtt_watchdog_loop, args=(mqtt_client,), daemon=True).start()
+    if mqtt_client is not None:
+        threading.Thread(target=mqtt_watchdog_loop, args=(mqtt_client,), daemon=True).start()
     threading.Thread(target=pg_writer_loop, daemon=True).start()
     threading.Thread(target=pvoutput_loop, daemon=True).start()
     threading.Thread(target=mindergas_loop, daemon=True).start()
@@ -1452,10 +1486,11 @@ def main():
                     )
                 except Exception:
                     log.exception("Could not compute derived power flow")
-            try:
-                publish_mqtt(mqtt_client, values)
-            except Exception:
-                log.exception("MQTT publish failed")
+            if ENABLE_MQTT_PUBLISH:
+                try:
+                    publish_mqtt(mqtt_client, values)
+                except Exception:
+                    log.exception("MQTT publish failed")
         except Exception:
             log.exception("Inverter poll failed")
 

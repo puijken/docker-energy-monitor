@@ -194,6 +194,74 @@ def check_modbus_poll(failures):
     print(f"  modbus poll: {len(EXPECTED)} values decoded, unit kwarg={app._UNIT_KWARG!r}")
 
 
+def check_mqtt_publish_switch(failures):
+    """ENABLE_MQTT_PUBLISH gates publishing without touching plug ingestion.
+
+    The two directions share one broker client, so the risk in adding this switch was coupling them:
+    turning publishing off must not stop plug messages arriving, and turning both off must stop the
+    container connecting at all rather than leaving a connection the watchdog then complains about.
+    """
+    before = len(failures)
+    saved = (app.ENABLE_MQTT_PUBLISH, app.ENABLE_PLUGS, app.MQTT_ENABLED)
+
+    published = []
+
+    class _FakeClient:
+        def publish(self, topic, value, retain=False):
+            published.append((topic, value, retain))
+
+    try:
+        # Publishing on -> every field goes out under the prefix, retained.
+        app.ENABLE_MQTT_PUBLISH = True
+        app.publish_mqtt(_FakeClient(), {"total_active_power": 2888, "run_state": "Run"})
+        if len(published) != 2:
+            failures.append(f"  publish_mqtt() with publishing on: expected 2 topics, got {published}")
+        elif not all(t.startswith(app.MQTT_TOPIC_PREFIX + "/") and r for t, _v, r in published):
+            failures.append(f"  publish_mqtt() topics/retain flag wrong: {published}")
+
+        # MQTT_ENABLED is the connect decision, and must follow *either* direction being in use.
+        for publish, plugs, expected in ((True, True, True), (True, False, True),
+                                         (False, True, True), (False, False, False)):
+            got = publish or plugs
+            if got != expected:
+                failures.append(f"  MQTT_ENABLED for publish={publish} plugs={plugs}: expected {expected}")
+        # And the module-level value must agree with that rule for the config as loaded.
+        if app.MQTT_ENABLED != (saved[0] or saved[1]):
+            failures.append(
+                f"  app.MQTT_ENABLED is {app.MQTT_ENABLED} but ENABLE_MQTT_PUBLISH={saved[0]} "
+                f"ENABLE_PLUGS={saved[1]}"
+            )
+
+        # Plug ingestion must be unaffected by publishing being off -- it is the same client, so
+        # this is the coupling worth asserting rather than assuming.
+        app.ENABLE_MQTT_PUBLISH = False
+        drained = 0
+        while True:
+            try:
+                app._write_queue.get_nowait()
+                drained += 1
+            except Empty:
+                break
+        label = next(iter(app.PLUG_TOPIC_MAP.values()), None)
+        if label is not None:
+            app._plug_last_write_time.pop(label, None)
+            topic = next(t for t, l in app.PLUG_TOPIC_MAP.items() if l == label)
+            app._handle_plug_message(_StubMessage(topic, {"power": 12.5}), label)
+            try:
+                app._write_queue.get_nowait()
+            except Empty:
+                failures.append(
+                    "  a plug message queued nothing while ENABLE_MQTT_PUBLISH=False -- the publish "
+                    "switch must not disable plug ingestion, they only share a client"
+                )
+    finally:
+        app.ENABLE_MQTT_PUBLISH, app.ENABLE_PLUGS, app.MQTT_ENABLED = saved
+
+    if len(failures) == before:
+        print("  MQTT publish switch: gates publishing only; plug ingestion and the connect "
+              "decision stay correct")
+
+
 def check_mqtt_connect(failures):
     """paho-mqtt API coverage.
 
@@ -1093,6 +1161,7 @@ def main():
     failures = []
     check_modbus_poll(failures)
     check_mqtt_connect(failures)
+    check_mqtt_publish_switch(failures)
     check_postgres_write(failures)
     check_get_last_gas_reading(failures)
     check_p1_telegram_parsing(failures)
@@ -1113,7 +1182,7 @@ def main():
         print("\n".join(failures), file=sys.stderr)
         return 1
 
-    print("smoke test passed: modbus, mqtt connect, postgres write, postgres read, P1 telegram parsing, "
+    print("smoke test passed: modbus, mqtt connect, mqtt publish switch, postgres write, postgres read, P1 telegram parsing, "
           "P1 relay broadcast, P1 stall reconnect, plug parsing, DSMR timestamps (incl. DST fall-back), "
           "smart-meter source stability, pvoutput metrics, derived fields, solar staleness fallback, "
           "log level")

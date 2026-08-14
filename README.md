@@ -2,7 +2,7 @@
 
 Collects whole-house energy data into one TimescaleDB (Postgres): solar generation read from a
 Sungrow inverter over Modbus TCP, and electricity/gas consumption read directly off the P1 smart
-meter's telegram stream over the network. Publishes solar values to MQTT, and optionally uploads
+meter's telegram stream over the network. Optionally re-publishes solar values to MQTT, and uploads
 to PVOutput (every few minutes) and Mindergas (once daily). Built as a self-maintained replacement
 for the third-party `bohdans/sungather` image.
 
@@ -24,7 +24,9 @@ for the third-party `bohdans/sungather` image.
   [Smart plugs](#smart-plugs-zigbee2mqtt). Electricity is *not* schemaless in the same way: OBIS
   codes are mapped through a fixed allowlist and anything unlisted is dropped at parse time, so a
   new smart-meter field does need one.
-- Publishes the same values to MQTT, one topic per field under `MQTT_TOPIC_PREFIX`.
+- Optionally re-publishes the inverter readings to MQTT, one retained topic per field under
+  `MQTT_TOPIC_PREFIX` (gated by `ENABLE_MQTT_PUBLISH`, default on). Outbound only — nothing here
+  reads it back, and Postgres is written either way.
 - Optionally pushes a status update to PVOutput on an interval (gated by `ENABLE_PVOUTPUT`,
   default off).
 - Optionally pushes the previous day's cumulative gas meter reading to Mindergas shortly after
@@ -60,11 +62,12 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `POSTGRES_USER` | *required* | Database user |
 | `POSTGRES_PASSWORD` | *required* | Database password |
 | `POSTGRES_TABLE` | `solar` | Table name written to for inverter readings |
-| `MQTT_HOST` | *required* | MQTT broker hostname/IP |
+| `MQTT_HOST` | *required if MQTT is used* | Broker hostname/IP. Only required when `ENABLE_MQTT_PUBLISH` or `ENABLE_PLUGS` is on; with both off the container never connects to a broker at all. |
 | `MQTT_PORT` | `1883` | MQTT broker port |
 | `MQTT_USERNAME` | *(none)* | MQTT username, if required |
 | `MQTT_PASSWORD` | *(none)* | MQTT password, if required |
-| `MQTT_TOPIC_PREFIX` | `energy/solar` | Topic prefix; one sub-topic per field |
+| `ENABLE_MQTT_PUBLISH` | `true` | Re-publish each inverter reading to MQTT, one retained topic per field. Purely an outbound copy — Postgres is written either way and nothing here reads it back, so turning it off loses no data. Does **not** affect plug ingestion, which shares the same connection. |
+| `MQTT_TOPIC_PREFIX` | `energy/solar` | Topic prefix for the above; one sub-topic per field. Only inverter readings are published — electricity, gas and plug data go to Postgres only. |
 | `MQTT_PUBLISH_FIELDS` | *(all)* | Comma-separated register names to publish, e.g. `total_active_power,run_state`. Leave unset to publish everything. |
 | `ENABLE_P1` | `false` | Connect to a P1 telegram relay for smart-meter data. See [Smart-meter data](#smart-meter-data). |
 | `P1_HOST` | *required if `ENABLE_P1=true`* | Host/IP of the P1 telegram relay |

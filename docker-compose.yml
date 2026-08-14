@@ -11,11 +11,18 @@ services:
       - POSTGRES_DB=energy
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      # Broker used to publish solar values and (if ENABLE_PLUGS) to consume Zigbee2MQTT
+      # Broker used to (optionally) publish inverter/electricity readings and, if ENABLE_PLUGS is
+      # set, to consume Zigbee2MQTT. ENABLE_MQTT_PUBLISH defaults to false, so it's set explicitly
+      # here -- otherwise MQTT_HOST below configures a broker connection that's never opened.
       - MQTT_HOST=192.168.1.10
       - MQTT_USERNAME=${MQTT_USERNAME}
       - MQTT_PASSWORD=${MQTT_PASSWORD}
+      - ENABLE_MQTT_PUBLISH=true
+      # Two independent topic trees, both gated by ENABLE_MQTT_PUBLISH above: inverter readings
+      # under the first, smart-meter electricity under the second (needs ENABLE_P1 below).
+      # Separate so a subscriber can take either side without filtering the other out.
       - MQTT_TOPIC_PREFIX=energy/solar
+      - MQTT_ELEC_TOPIC_PREFIX=energy/electricity
       # Smart meter, read directly off the P1 telegram stream -- a plain-TCP relay of the meter's
       # P1 port (e.g. a ser2net `connection:` block), not DSMR-reader's MQTT export or database.
       # See README.md ("Smart-meter data") for why, and for sharing one P1 port between this

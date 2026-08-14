@@ -65,10 +65,12 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `POSTGRES_USER` | *required* | Database user |
 | `POSTGRES_PASSWORD` | *required* | Database password |
 | `POSTGRES_TABLE` | `solar` | Table name written to for inverter readings |
+| `WRITE_QUEUE_SIZE` | `2000` | Max points buffered for the Postgres writer thread. A prolonged outage drops the oldest queued point first rather than growing without bound. |
 | `MQTT_HOST` | *required if MQTT is used* | Broker hostname/IP. Only required when `ENABLE_MQTT_PUBLISH` or `ENABLE_PLUGS` is on; with both off the container never connects to a broker at all. |
 | `MQTT_PORT` | `1883` | MQTT broker port |
 | `MQTT_USERNAME` | *(none)* | MQTT username, if required |
 | `MQTT_PASSWORD` | *(none)* | MQTT password, if required |
+| `MQTT_WARN_AFTER` | `60` | Seconds without a broker connection before warning it looks unreachable; repeats every interval while still disconnected |
 | `ENABLE_MQTT_PUBLISH` | `false` | Re-publish each inverter reading to MQTT, one retained topic per field. Purely an outbound copy — Postgres is written either way and nothing here reads it back. **Changed from `true` to `false` on 2026-08-14**: if you are upgrading and something subscribes to these topics, set this to `true` or it goes quiet. Does **not** affect plug ingestion, which shares the same connection. |
 | `MQTT_TOPIC_PREFIX` | `energy/solar` | Topic prefix for **inverter** readings; one sub-topic per field. |
 | `MQTT_ELEC_TOPIC_PREFIX` | `energy/electricity` | Topic prefix for **smart-meter electricity** readings, published at `P1_MIN_INTERVAL` cadence. Only produces anything when `ENABLE_P1` is on. Gas and plug data are not published. |
@@ -404,9 +406,32 @@ naive value as the session's local time, so passing naive local time here would 
 
 ## Tests
 
-`smoke_test.py` starts an in-process Modbus server serving known register values, polls it through
-`app.poll_inverter`, and asserts the decoded results — including that DC input covers AC output and
-that the MPPT strings account for the DC total, which catches word-order and scaling regressions.
+`smoke_test.py` exercises every external dependency this container talks to — Modbus, MQTT and
+Postgres — without a real inverter, broker or database. It started out covering only the register
+decode path and has grown alongside the features above:
+
+- **Modbus decode**: an in-process Modbus server serves known register values, polled through
+  `app.poll_inverter`; asserts the decoded results, that DC input covers AC output, and that the
+  two MPPT strings sum to `total_dc_power` — catching word-order and scaling regressions.
+- **MQTT client + the `ENABLE_MQTT_PUBLISH` switch**: `app.mqtt_connect()` still returns a working
+  client, and publishing toggles on/off correctly without disabling plug ingestion, which shares
+  the same broker connection.
+- **Postgres write and read paths**: `app.write_postgres()` / `app.get_last_gas_reading()` against
+  a fake capturing connection — no real database needed, but the SQL/params/`ON CONFLICT` clause
+  are checked exactly.
+- **P1 telegram ingestion**: framing and CRC verification across split reads and a corrupted
+  telegram, OBIS parsing into electricity/gas readings, and a connection that stays open but stops
+  delivering — `p1_reader_loop` must tear it down and rebuild it rather than waiting on it forever.
+- **DSMR timestamps**: the `S`/`W` suffix resolving the autumn DST fall-back hour to two distinct
+  UTC instants, rather than the two passes colliding on one primary key.
+- **P1 relay fan-out**: a healthy downstream client keeps receiving bytes; one whose `sendall()`
+  raises is dropped and closed rather than taking down the broadcast.
+- **Smart plugs**: real captured Zigbee2MQTT payloads from both plug models on this network (Aqara,
+  Tuya), checking that only the common fields are kept and per-model extras are dropped.
+- **PVOutput metrics**: the `app.METRICS` formulas, and that a missing/stale electricity reading
+  degrades the upload to inverter-only values rather than losing it.
+- **Smart-meter `source` stability**: `P1_SOURCE` stays pinned to `"dsmr"`, since changing it splits
+  every downstream continuous aggregate at the cutover instant.
 
 ```bash
 docker build -t energy-monitor:dev .
@@ -414,10 +439,10 @@ docker run --rm -v "$PWD/smoke_test.py:/app/smoke_test.py:ro" energy-monitor:dev
 ```
 
 Both workflows run it: `pr-validate.yml` on pull requests, and `build.yml` **before** pushing the
-image, so a dependency bump that breaks decoding at runtime can never reach `:latest`. That matters
-because building alone proves nothing here — pymodbus 3.14 removed the `slave=` keyword in favour of
-`device_id=`, which built cleanly and failed on every poll. The app now resolves that argument name
-from the function signature, and the test would catch the next such change.
+image, so a dependency bump that breaks any of the above at runtime can never reach `:latest`. That
+matters because building alone proves nothing here — pymodbus 3.14 removed the `slave=` keyword in
+favour of `device_id=`, which built cleanly and failed on every poll. The app now resolves that
+argument name from the function signature, and the test would catch the next such change.
 
 Note that Dependabot auto-merges anything it doesn't classify as `semver-major`, and it only waits
 for status checks that branch protection marks **required**. Without branch protection on `main`,

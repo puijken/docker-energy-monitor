@@ -7,8 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A single-file Python service (`app.py`) that polls a Sungrow inverter over Modbus TCP, reads
 electricity/gas readings directly off the P1 smart-meter telegram stream over the network, and
 consumes Zigbee2MQTT for per-circuit smart-plug submetering; writes everything to TimescaleDB,
-republishes solar values to MQTT, and optionally uploads to PVOutput and Mindergas. Built as a
-self-maintained replacement for the third-party `bohdans/sungather` image. Published to
+optionally republishes inverter and smart-meter readings to MQTT (gated by `ENABLE_MQTT_PUBLISH`,
+default off), and optionally uploads to PVOutput and Mindergas. Built as a self-maintained
+replacement for the third-party `bohdans/sungather` image. Published to
 `ghcr.io/puijken/energy-monitor`.
 
 **This repo is public.** Real device names, IPs, and deployment status belong in a gitignored
@@ -145,10 +146,18 @@ Key structures/functions to know before editing:
 ## Tests
 
 `smoke_test.py` spins up an in-process Modbus TCP server with known register values, polls it
-through the real `poll_inverter`, and asserts: decoded values match expected, DC input covers AC
-output, and the two MPPT strings sum to `total_dc_power`. This is what caught a pymodbus 3.14
-change (`slave=` → `device_id=` kwarg) that built fine and failed on every poll in production —
-building alone proves nothing, hence the smoke test being a required pre-push step in `build.yml`.
+through the real `poll_inverter`, and asserts decoded values match expected, DC input covers AC
+output, and the two MPPT strings sum to `total_dc_power`. It has grown well past Modbus alone:
+MQTT client construction and the `ENABLE_MQTT_PUBLISH` switch (publishing toggles without
+disabling plug ingestion, which shares the same connection), the Postgres write/read paths against
+a fake connection, P1 telegram framing/CRC/OBIS parsing plus the stall-reconnect and DST
+fall-back-hour timestamp handling, the P1 relay's fan-out, Zigbee2MQTT plug payloads from both
+models on this network, the PVOutput metric formulas, the derived `power_flow` fields and solar
+staleness fallback, and that `P1_SOURCE` stays pinned to `dsmr` are all covered too — see
+`smoke_test.py`'s own module docstring and final summary line for the complete list. The original
+Modbus check is what caught a pymodbus 3.14 change (`slave=` → `device_id=` kwarg) that built fine
+and failed on every poll in production — building alone proves nothing, hence the smoke test being
+a required pre-push step in `build.yml`.
 
 Dependabot auto-merges non-major bumps, and without branch protection on `main`, `pr-validate.yml`
 does not block a merge on its own — `build.yml`'s pre-push smoke test run is what actually

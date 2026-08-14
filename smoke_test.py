@@ -12,6 +12,11 @@ surface at runtime. This file now additionally covers, all without a real broker
 
   - paho-mqtt: app.mqtt_connect() still returns a working client (catches a Client()/
     callback_api_version constructor change).
+  - The ENABLE_MQTT_PUBLISH switch: publishing toggles on/off for both the inverter and
+    smart-meter topic trees, an inverter-only MQTT_PUBLISH_FIELDS allowlist doesn't leak onto the
+    smart-meter side, MQTT_ENABLED follows either direction being in use, and -- the actual risk in
+    adding this switch, since both directions share one broker client -- turning publishing off
+    does not also stop plug messages from being queued.
   - psycopg + the Postgres write path: app.write_postgres() executes the expected SQL/params
     against a fake capturing connection/cursor (no real database needed) -- catching both a
     psycopg API change and a regression in the write path itself (wrong table, wrong ON
@@ -27,6 +32,17 @@ surface at runtime. This file now additionally covers, all without a real broker
     being discarded without wedging the reader. app.parse_p1_telegram() for electricity + gas OBIS
     extraction, and app._handle_p1_telegram() for what ends up on the write queue (electricity,
     gas dedup against a repeated M-Bus capture, and the derived power_flow point).
+  - P1 stall reconnect: app.p1_reader_loop() run for real against a real socket whose peer accepts
+    the connection and then sends nothing at all -- the failure mode a recv() timeout used to
+    `continue` on forever. Asserts the loop actually rebuilds the connection after
+    P1_STALL_TIMEOUT rather than waiting on a socket that looks healthy but isn't.
+  - DSMR timestamp parsing: app._parse_dsmr_timestamp() against explicit UTC instants (not
+    recomputed with the implementation's own arithmetic, which would make the check tautological),
+    including the autumn DST fall-back hour, where the S/W suffix is the only thing separating two
+    otherwise-identical local timestamps -- getting this wrong silently overwrites an hour of
+    readings a year via the write path's ON CONFLICT.
+  - Smart-meter source stability: app.P1_SOURCE stays pinned to "dsmr", since it is a GROUP BY key
+    in every downstream continuous aggregate and changing it splits history at the cutover instant.
   - The P1 relay (app._relay_broadcast(), ENABLE_P1_RELAY): reaches every connected downstream
     client, and drops+closes one whose send raises rather than letting that propagate out of the
     broadcast -- this is what stands in for DSMR-reader (or anything else) getting the P1 stream

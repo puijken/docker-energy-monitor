@@ -211,13 +211,39 @@ def check_mqtt_publish_switch(failures):
             published.append((topic, value, retain))
 
     try:
-        # Publishing on -> every field goes out under the prefix, retained.
         app.ENABLE_MQTT_PUBLISH = True
-        app.publish_mqtt(_FakeClient(), {"total_active_power": 2888, "run_state": "Run"})
+
+        # Inverter side: every field under MQTT_TOPIC_PREFIX, retained.
+        app.publish_mqtt(_FakeClient(), {"total_active_power": 2888, "run_state": "Run"},
+                         app.MQTT_TOPIC_PREFIX, app.MQTT_PUBLISH_FIELDS)
         if len(published) != 2:
-            failures.append(f"  publish_mqtt() with publishing on: expected 2 topics, got {published}")
+            failures.append(f"  publish_mqtt() inverter side: expected 2 topics, got {published}")
         elif not all(t.startswith(app.MQTT_TOPIC_PREFIX + "/") and r for t, _v, r in published):
-            failures.append(f"  publish_mqtt() topics/retain flag wrong: {published}")
+            failures.append(f"  publish_mqtt() inverter topics/retain flag wrong: {published}")
+
+        # Smart-meter side: its own prefix, and no MQTT_PUBLISH_FIELDS filter (that knob is
+        # documented in terms of inverter register names, which would drop every meter field).
+        published.clear()
+        elec = {"electricity_currently_delivered": 0.0, "phase_voltage_l1": 235.0}
+        app.publish_mqtt(_FakeClient(), elec, app.MQTT_ELEC_TOPIC_PREFIX)
+        if sorted(t for t, _v, _r in published) != [
+            f"{app.MQTT_ELEC_TOPIC_PREFIX}/electricity_currently_delivered",
+            f"{app.MQTT_ELEC_TOPIC_PREFIX}/phase_voltage_l1",
+        ]:
+            failures.append(f"  publish_mqtt() smart-meter side: unexpected topics {published}")
+
+        # The two trees must not overlap, or a subscriber can't take one without the other.
+        if app.MQTT_TOPIC_PREFIX == app.MQTT_ELEC_TOPIC_PREFIX:
+            failures.append(
+                f"  MQTT_TOPIC_PREFIX and MQTT_ELEC_TOPIC_PREFIX are both {app.MQTT_TOPIC_PREFIX!r}"
+            )
+
+        # An inverter-only allowlist must not silently apply to the meter side.
+        published.clear()
+        app.publish_mqtt(_FakeClient(), elec, app.MQTT_ELEC_TOPIC_PREFIX, {"total_active_power"})
+        if published:
+            failures.append(f"  a filter that matches nothing should publish nothing, got {published}")
+        published.clear()
 
         # MQTT_ENABLED is the connect decision, and must follow *either* direction being in use.
         for publish, plugs, expected in ((True, True, True), (True, False, True),
@@ -242,11 +268,17 @@ def check_mqtt_publish_switch(failures):
                 drained += 1
             except Empty:
                 break
-        label = next(iter(app.PLUG_TOPIC_MAP.values()), None)
-        if label is not None:
-            app._plug_last_write_time.pop(label, None)
-            topic = next(t for t, l in app.PLUG_TOPIC_MAP.items() if l == label)
-            app._handle_plug_message(_StubMessage(topic, {"power": 12.5}), label)
+        # Configures its own topic map rather than borrowing whatever another check happens to have
+        # left behind: PLUG_TOPICS is unset in this harness, so relying on the ambient map meant
+        # this assertion silently skipped itself -- a check that cannot fail is worse than no check.
+        topic, label = "zigbee2mqtt/Publish switch test plug", "switch-test"
+        orig_map, orig_seen = dict(app.PLUG_TOPIC_MAP), set(app._plug_seen)
+        app.PLUG_TOPIC_MAP.clear()
+        app.PLUG_TOPIC_MAP[topic] = label
+        app._plug_last_write_time.pop(label, None)
+        try:
+            # Through the real dispatch path, not straight into the handler.
+            app._on_mqtt_message(None, None, _StubMessage(topic, {"power": 12.5}))
             try:
                 app._write_queue.get_nowait()
             except Empty:
@@ -254,12 +286,53 @@ def check_mqtt_publish_switch(failures):
                     "  a plug message queued nothing while ENABLE_MQTT_PUBLISH=False -- the publish "
                     "switch must not disable plug ingestion, they only share a client"
                 )
+        finally:
+            app.PLUG_TOPIC_MAP.clear()
+            app.PLUG_TOPIC_MAP.update(orig_map)
+            app._plug_seen.clear()
+            app._plug_seen.update(orig_seen)
+            app._plug_last_write_time.pop(label, None)
     finally:
         app.ENABLE_MQTT_PUBLISH, app.ENABLE_PLUGS, app.MQTT_ENABLED = saved
 
+    # End to end: a real telegram through _handle_p1_telegram must publish under the electricity
+    # prefix when the switch is on, and nothing at all when it's off. Asserting on publish_mqtt()
+    # alone would not catch the call site being missing or mis-gated.
+    # _handle_p1_telegram mutates a fair amount of module state (write throttle, gas dedup, caches,
+    # first-seen log flags). All of it has to go back, or the later P1 checks inherit it -- which
+    # they did on the first attempt: the throttle stayed set and their electricity write was
+    # silently skipped, failing a test that had nothing to do with this one.
+    saved_client, saved_min = app._mqtt_client, app.P1_MIN_INTERVAL
+    saved_p1_state = (app._last_elec_write_time, app._last_gas_written, app._elec_cache,
+                      app._elec_seen, app._gas_seen)
+    for switch, expect_topics in ((True, True), (False, False)):
+        published.clear()
+        app.ENABLE_MQTT_PUBLISH = switch
+        app._mqtt_client = _FakeClient()
+        app.P1_MIN_INTERVAL = 0            # never throttled, so the publish is deterministic
+        app._last_elec_write_time = 0.0
+        app._handle_p1_telegram(_p1_telegram_bytes().decode("ascii"))
+        got = [t for t, _v, _r in published if t.startswith(app.MQTT_ELEC_TOPIC_PREFIX + "/")]
+        if expect_topics and not got:
+            failures.append(
+                "  a P1 telegram published no electricity topics with ENABLE_MQTT_PUBLISH=True"
+            )
+        elif not expect_topics and got:
+            failures.append(
+                f"  a P1 telegram published {len(got)} topic(s) with ENABLE_MQTT_PUBLISH=False"
+            )
+    app._mqtt_client, app.P1_MIN_INTERVAL = saved_client, saved_min
+    (app._last_elec_write_time, app._last_gas_written, app._elec_cache,
+     app._elec_seen, app._gas_seen) = saved_p1_state
+    while True:
+        try:
+            app._write_queue.get_nowait()
+        except Empty:
+            break
+
     if len(failures) == before:
-        print("  MQTT publish switch: gates publishing only; plug ingestion and the connect "
-              "decision stay correct")
+        print("  MQTT publish switch: gates both topic trees (solar + electricity), keeps them "
+              "separate, and leaves plug ingestion alone")
 
 
 def check_mqtt_connect(failures):

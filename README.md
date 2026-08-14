@@ -24,17 +24,20 @@ for the third-party `bohdans/sungather` image.
   [Smart plugs](#smart-plugs-zigbee2mqtt). Electricity is *not* schemaless in the same way: OBIS
   codes are mapped through a fixed allowlist and anything unlisted is dropped at parse time, so a
   new smart-meter field does need one.
-- Optionally re-publishes the inverter readings to MQTT, one retained topic per field under
-  `MQTT_TOPIC_PREFIX` (gated by `ENABLE_MQTT_PUBLISH`, default on). Outbound only — nothing here
-  reads it back, and Postgres is written either way.
+- Optionally re-publishes readings to MQTT, one retained topic per field, under two separate
+  prefixes: inverter data under `MQTT_TOPIC_PREFIX` and smart-meter electricity under
+  `MQTT_ELEC_TOPIC_PREFIX`, so a subscriber can take either side alone. Both are gated by the one
+  `ENABLE_MQTT_PUBLISH` switch (default off). Outbound only — nothing here reads it back, and
+  Postgres is written either way.
 - Optionally pushes a status update to PVOutput on an interval (gated by `ENABLE_PVOUTPUT`,
   default off).
 - Optionally pushes the previous day's cumulative gas meter reading to Mindergas shortly after
   midnight (gated by `ENABLE_MINDERGAS`, default off), reading the value back out of the
   `gas_positions` table this container itself writes.
 
-Both external-upload flags default to `false` in the image, so this can run safely alongside an
-existing uploader (SunGather, DSMR-reader's own exporters) without double-reporting. Each upload
+All three outbound integrations (`ENABLE_MQTT_PUBLISH`, `ENABLE_PVOUTPUT`, `ENABLE_MINDERGAS`)
+default to `false`, so nothing leaves this container unless you opt in and it can run safely
+alongside an existing uploader (SunGather, DSMR-reader's own exporters) without double-reporting. Each upload
 should be owned by exactly one uploader, so disable the old one at its source before enabling the
 matching flag here; the two are independent and can be cut over separately.
 
@@ -66,8 +69,9 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `MQTT_PORT` | `1883` | MQTT broker port |
 | `MQTT_USERNAME` | *(none)* | MQTT username, if required |
 | `MQTT_PASSWORD` | *(none)* | MQTT password, if required |
-| `ENABLE_MQTT_PUBLISH` | `true` | Re-publish each inverter reading to MQTT, one retained topic per field. Purely an outbound copy — Postgres is written either way and nothing here reads it back, so turning it off loses no data. Does **not** affect plug ingestion, which shares the same connection. |
-| `MQTT_TOPIC_PREFIX` | `energy/solar` | Topic prefix for the above; one sub-topic per field. Only inverter readings are published — electricity, gas and plug data go to Postgres only. |
+| `ENABLE_MQTT_PUBLISH` | `false` | Re-publish each inverter reading to MQTT, one retained topic per field. Purely an outbound copy — Postgres is written either way and nothing here reads it back. **Changed from `true` to `false` on 2026-08-14**: if you are upgrading and something subscribes to these topics, set this to `true` or it goes quiet. Does **not** affect plug ingestion, which shares the same connection. |
+| `MQTT_TOPIC_PREFIX` | `energy/solar` | Topic prefix for **inverter** readings; one sub-topic per field. |
+| `MQTT_ELEC_TOPIC_PREFIX` | `energy/electricity` | Topic prefix for **smart-meter electricity** readings, published at `P1_MIN_INTERVAL` cadence. Only produces anything when `ENABLE_P1` is on. Gas and plug data are not published. |
 | `MQTT_PUBLISH_FIELDS` | *(all)* | Comma-separated register names to publish, e.g. `total_active_power,run_state`. Leave unset to publish everything. |
 | `ENABLE_P1` | `false` | Connect to a P1 telegram relay for smart-meter data. See [Smart-meter data](#smart-meter-data). |
 | `P1_HOST` | *required if `ENABLE_P1=true`* | Host/IP of the P1 telegram relay |

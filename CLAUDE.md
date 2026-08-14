@@ -103,6 +103,11 @@ Key structures/functions to know before editing:
   and AC/DC-ratio assertions exist to catch.
 - `WORK_STATES` — maps `work_state_1` (register 5038) to human states; unmapped codes log as
   `Unknown (0x....)` rather than being silently dropped.
+- `publish_mqtt` — takes the prefix and an optional field allowlist, so one function serves both
+  topic trees. Called from *two* threads: the poll loop (inverter, `MQTT_TOPIC_PREFIX`) and
+  `_handle_p1_telegram` (electricity, `MQTT_ELEC_TOPIC_PREFIX`, on the same throttle as the
+  Postgres write). The latter reaches the client via the module-level `_mqtt_client`, set once by
+  `main()`; paho's `publish()` is thread-safe so no lock is involved.
 - `crc16_arc` / `extract_telegram` — CRC-16/ARC verification and telegram framing over a raw byte
   stream. `extract_telegram` is called in a loop that keeps draining the buffer as long as it's
   shrinking (a successful parse *and* a discarded CRC failure both still consume bytes), which is

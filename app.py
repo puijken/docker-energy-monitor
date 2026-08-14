@@ -87,16 +87,28 @@ MQTT_PORT = env_int("MQTT_PORT", 1883)
 MQTT_USERNAME = env("MQTT_USERNAME")
 MQTT_PASSWORD = env("MQTT_PASSWORD")
 MQTT_TOPIC_PREFIX = env("MQTT_TOPIC_PREFIX", "energy/solar").rstrip("/")
+# Separate prefix for smart-meter electricity readings, so a subscriber can take one side without
+# the other and neither has to filter by field name. Same ENABLE_MQTT_PUBLISH switch governs both;
+# this one only produces anything when ENABLE_P1 is on, since that is where the readings come from.
+MQTT_ELEC_TOPIC_PREFIX = env("MQTT_ELEC_TOPIC_PREFIX", "energy/electricity").rstrip("/")
 # Re-publish each inverter reading to MQTT, one retained topic per field under MQTT_TOPIC_PREFIX.
 # Purely an outbound copy for other systems to consume -- nothing in this container reads it back,
 # and Postgres is written either way, so turning it off loses no data here.
 #
-# Default on, because that is the long-standing behaviour and someone may have a home-automation
-# flow bound to those topics. Worth checking whether anything still subscribes before leaving it on:
-# publishing to topics nobody reads is invisible waste, and a consumer left pointing at an older
-# exporter's topic is invisible breakage. Note this gates *publishing* only -- plug ingestion
-# (ENABLE_PLUGS) uses the same broker connection and is unaffected.
-ENABLE_MQTT_PUBLISH = env_bool("ENABLE_MQTT_PUBLISH", True)
+# Default OFF, matching the other outbound integrations here (ENABLE_PVOUTPUT, ENABLE_MINDERGAS):
+# anything that leaves this container and lands somewhere else should be opted into, not inherited.
+# This was on by default until 2026-08-14 -- **if you are upgrading and something subscribes to
+# these topics, set ENABLE_MQTT_PUBLISH=true or it will go quiet.**
+#
+# The reason for the flip: publishing to topics nobody reads is invisible waste, and it is easy not
+# to notice. On the deployment this was written for, all ~15 fields were being published every
+# SCAN_INTERVAL while every consumer on the network had been retired or was still bound to a
+# decommissioned exporter's topic. Off by default makes that state the explicit choice rather than
+# the silent one.
+#
+# Gates *publishing* only -- plug ingestion (ENABLE_PLUGS) uses the same broker connection and is
+# unaffected.
+ENABLE_MQTT_PUBLISH = env_bool("ENABLE_MQTT_PUBLISH", False)
 # How long to allow for the broker connection before warning, then re-warning, about it.
 MQTT_WARN_AFTER = env_int("MQTT_WARN_AFTER", 60)
 # Comma-separated register names to publish (e.g. "total_active_power,run_state"). Empty/unset
@@ -452,6 +464,12 @@ _state_lock = threading.Lock()
 latest_values = {}
 latest_poll_monotonic = None
 
+# The paho client, published to from two threads: the poll loop (inverter readings) and
+# p1_reader_loop (smart-meter readings). Held as module state rather than threaded through because
+# p1_reader_loop is started without it; paho's publish() is thread-safe, so no lock is needed. None
+# when MQTT is disabled entirely (see MQTT_ENABLED) or before main() has run.
+_mqtt_client = None
+
 # Latest electricity reading from the P1 telegram stream, as (values, monotonic_time) -- read by
 # build_pvoutput_params/derived_fields, written only by p1_reader_loop's own thread.
 _elec_lock = threading.Lock()
@@ -620,11 +638,21 @@ def get_last_gas_reading(before):
             return cur.fetchone()
 
 
-def publish_mqtt(mqtt_client, values):
+def publish_mqtt(mqtt_client, values, prefix, fields=None):
+    """Publishes each value as its own retained topic under `prefix`.
+
+    `fields`, when given, is an allowlist of names to publish. Only the inverter side passes one
+    (MQTT_PUBLISH_FIELDS, documented in terms of register names); the smart-meter side has a small
+    fixed field set and no equivalent knob, so filtering it by register names would be meaningless.
+
+    Retained so a subscriber connecting later immediately gets the current value instead of waiting
+    for the next update -- which matters more on the meter side, where a field that stops changing
+    would otherwise look absent.
+    """
     for name, value in values.items():
-        if MQTT_PUBLISH_FIELDS and name not in MQTT_PUBLISH_FIELDS:
+        if fields and name not in fields:
             continue
-        mqtt_client.publish(f"{MQTT_TOPIC_PREFIX}/{name}", value, retain=True)
+        mqtt_client.publish(f"{prefix}/{name}", value, retain=True)
 
 
 def build_pvoutput_params(values):
@@ -892,6 +920,16 @@ def _handle_p1_telegram(text):
         if not P1_MIN_INTERVAL or now - _last_elec_write_time >= P1_MIN_INTERVAL:
             _last_elec_write_time = now
             queue_write(elec, elec_ts_ns, ELEC_TABLE, P1_SOURCE)
+
+            # Published on the same throttle as the Postgres write rather than on every telegram.
+            # Telegrams arrive ~1/s, finer than a dashboard or home-automation subscriber needs, and
+            # this keeps the published cadence equal to the inverter side (P1_MIN_INTERVAL defaults
+            # to SCAN_INTERVAL) so the two topic trees stay in step.
+            if ENABLE_MQTT_PUBLISH and _mqtt_client is not None:
+                try:
+                    publish_mqtt(_mqtt_client, elec, MQTT_ELEC_TOPIC_PREFIX)
+                except Exception:
+                    log.exception("MQTT publish of electricity readings failed")
 
             # Also refresh power_flow here, not just from the solar poll loop -- the smart meter
             # keeps reporting all night even when the inverter is asleep and Modbus stops
@@ -1324,6 +1362,17 @@ def validate_config():
         log.info("MQTT disabled entirely (no publishing, no plug ingestion) -- not connecting to a broker")
     if MQTT_PUBLISH_FIELDS and not ENABLE_MQTT_PUBLISH:
         log.warning("MQTT_PUBLISH_FIELDS is set but ENABLE_MQTT_PUBLISH is false, so nothing is published")
+    if ENABLE_MQTT_PUBLISH and not ENABLE_P1:
+        log.info(
+            "Publishing inverter readings under %s only; %s stays empty because ENABLE_P1 is false",
+            MQTT_TOPIC_PREFIX, MQTT_ELEC_TOPIC_PREFIX,
+        )
+    if ENABLE_MQTT_PUBLISH and MQTT_TOPIC_PREFIX == MQTT_ELEC_TOPIC_PREFIX:
+        log.warning(
+            "MQTT_TOPIC_PREFIX and MQTT_ELEC_TOPIC_PREFIX are both %r -- inverter and smart-meter "
+            "fields will share one topic tree. Field names don't currently collide, so nothing is "
+            "lost, but the two are meant to be separable.", MQTT_TOPIC_PREFIX,
+        )
 
     unknown = MQTT_PUBLISH_FIELDS - set(REGISTERS) - {"run_state"}
     if unknown:
@@ -1416,7 +1465,7 @@ def validate_config():
 def main():
     log.info(
         "Starting energy-monitor: inverter=%s:%s scan_interval=%ss p1=%s(%s:%s) p1_relay=%s(%s:%s) "
-        "mqtt_publish=%s plugs=%s(%d) pvoutput=%s mindergas=%s",
+        "mqtt_publish=%s(%s,%s) plugs=%s(%d) pvoutput=%s mindergas=%s",
         INVERTER_HOST,
         INVERTER_PORT,
         SCAN_INTERVAL,
@@ -1427,6 +1476,8 @@ def main():
         P1_RELAY_BIND,
         P1_RELAY_PORT,
         ENABLE_MQTT_PUBLISH,
+        MQTT_TOPIC_PREFIX,
+        MQTT_ELEC_TOPIC_PREFIX,
         ENABLE_PLUGS,
         len(PLUG_TOPIC_MAP),
         ENABLE_PVOUTPUT,
@@ -1434,12 +1485,13 @@ def main():
     )
     validate_config()
 
-    global latest_poll_monotonic
+    global latest_poll_monotonic, _mqtt_client
 
     modbus_client = ModbusTcpClient(INVERTER_HOST, port=INVERTER_PORT, timeout=10)
     # Skip the broker entirely when nothing publishes to it and nothing subscribes through it,
     # rather than holding a connection the watchdog would then warn about every MQTT_WARN_AFTER.
     mqtt_client = mqtt_connect() if MQTT_ENABLED else None
+    _mqtt_client = mqtt_client  # p1_reader_loop's thread publishes through this too
 
     if mqtt_client is not None:
         threading.Thread(target=mqtt_watchdog_loop, args=(mqtt_client,), daemon=True).start()
@@ -1488,7 +1540,7 @@ def main():
                     log.exception("Could not compute derived power flow")
             if ENABLE_MQTT_PUBLISH:
                 try:
-                    publish_mqtt(mqtt_client, values)
+                    publish_mqtt(mqtt_client, values, MQTT_TOPIC_PREFIX, MQTT_PUBLISH_FIELDS)
                 except Exception:
                     log.exception("MQTT publish failed")
         except Exception:

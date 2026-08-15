@@ -32,6 +32,18 @@ docker run --rm -v "$PWD/smoke_test.py:/app/smoke_test.py:ro" energy-monitor:dev
 # or, with deps installed locally:
 python3 smoke_test.py
 
+# Run one check instead of all 15 (the full run takes ~10s; check_p1_stall_reconnect alone sleeps
+# several seconds against a real socket). Check functions take a `failures` list and append to it
+# rather than raising, so an empty list means it passed:
+docker run --rm -v "$PWD/smoke_test.py:/app/smoke_test.py:ro" energy-monitor:dev \
+  python3 -c "import smoke_test; f=[]; smoke_test.check_dsmr_timestamp_parsing(f); print(f or 'ok')"
+# List them: grep '^def check_' smoke_test.py
+#
+# Checks happen not to depend on each other today, but nothing enforces that -- several mutate
+# module globals in app (write throttles, caches, PLUG_TOPIC_MAP) and must restore them in a
+# finally block. If one passes alone but fails in the suite, suspect leaked state from an earlier
+# check rather than the check itself.
+
 # Run standalone (needs a real or reachable inverter/broker/DB, or edit docker-compose.yml)
 docker compose up -d
 docker compose logs -f energy-monitor
@@ -97,8 +109,8 @@ that thread, `_elec_lock` covers `_elec_cache` (the cached electricity reading P
 
 Key structures/functions to know before editing:
 
-- `REGISTERS` (~line 190) — the Modbus register map: address, datatype, scaling per field. Addresses
-  are Sungrow's 1-based protocol numbers; `poll_inverter` does the `-1` for 0-based Modbus reads.
+- `REGISTERS` — the Modbus register map: address, datatype, scaling per field. Addresses are
+  Sungrow's 1-based protocol numbers; `poll_inverter` does the `-1` for 0-based Modbus reads.
 - `decode_register` — **32-bit values are low-word-first.** A big-endian read of the same register
   produces plausible-looking wrong numbers, not an error — this is what `smoke_test.py`'s MPPT-sum
   and AC/DC-ratio assertions exist to catch.
@@ -136,9 +148,12 @@ Key structures/functions to know before editing:
   PVOutput mapping section before touching this).
 - `get_last_gas_reading` / `push_mindergas` — reads gas history back out of Postgres (not the
   in-memory cache, unlike PVOutput) to find the last reading strictly before local midnight.
-- Extra/unmapped fields from a telegram or plug message land in each table's `extra` JSONB column
-  (`write_postgres`) rather than failing the write — this is what lets a new field show up with no
-  code change.
+- `TABLE_COLUMNS` / `write_postgres` — a field not listed for its table lands in that table's
+  `extra` JSONB column instead of failing the insert. That makes **plug** data genuinely schemaless:
+  a new Zigbee2MQTT field needs no code change here. It does **not** extend to smart-meter fields,
+  even though both go through the same write path — `parse_p1_telegram` has already filtered those
+  through the `_ELEC_OBIS_MAP` allowlist, so unlisted OBIS codes never reach `write_postgres` at all
+  and `electricity.extra` is always NULL.
 - `validate_config()` — startup checks (env combinations, PVOutput flag/metric agreement, that
   `ENABLE_MINDERGAS` has `ENABLE_P1` to actually feed it); prefer extending this over letting a bad
   config fail loudly at run time later.

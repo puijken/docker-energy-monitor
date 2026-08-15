@@ -394,9 +394,10 @@ PUBLISHABLE_FIELDS = (set(REGISTERS) - {"work_state_1"}) | {"run_state", "total_
 # Note this does NOT extend to smart-meter fields, despite both going through write_postgres:
 # parse_p1_telegram maps OBIS codes through the fixed _ELEC_OBIS_MAP allowlist and discards
 # everything else before write_postgres ever sees it, so ELEC_TABLE's `extra` is always NULL and a
-# new OBIS code does need a code change. Several real fields are dropped this way today (the active
-# tariff indicator 0-0:96.14.0, current 1-0:31.7.0, the power-failure and voltage sag/swell
-# counters); adding them means extending _ELEC_OBIS_MAP, not just the schema.
+# new OBIS code does need a code change. Real fields are still dropped this way today (the
+# power-failure and voltage sag/swell counters); adding one means extending _ELEC_OBIS_MAP, not
+# just the schema. The active tariff indicator (0-0:96.14.0) and L1 current (1-0:31.7.0) were
+# dropped this way until they were added to the map.
 TABLE_COLUMNS = {
     POSTGRES_TABLE: set(REGISTERS) | {"run_state"},
     # Must stay in step with the deploying stack's schema: a name listed here is written as a real

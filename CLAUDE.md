@@ -128,7 +128,12 @@ Key structures/functions to know before editing:
 - `parse_p1_telegram` — OBIS code → electricity fields + optional gas reading. The gas M-Bus
   channel is discovered per telegram (device-type-003 line), never assumed fixed. `_ELEC_OBIS_MAP`
   is a hard allowlist: unlisted codes are dropped here, *before* `write_postgres`, so unlike plug
-  data they never reach the `extra` JSONB column and adding one is a code change.
+  data they never reach the `extra` JSONB column and adding one is a code change. Adding a field
+  means `_ELEC_OBIS_MAP` **and** `TABLE_COLUMNS`, plus the column in the deploying stack's schema
+  **first** — a new image writing a column the DB lacks fails every insert; an older image ignoring
+  a column it doesn't know about is harmless. `_ELEC_INT_FIELDS` marks the ones the meter reports
+  as whole numbers (`electricity_tariff`, `phase_power_current_l1`), cast to `int` so they land in
+  integer columns; `2 == 2.0` in Python, so the smoke test asserts the *type* separately.
 - `_parse_dsmr_timestamp` — the S/W suffix is load-bearing, not decoration: it maps to `fold`, and
   it is the only thing separating the two passes of the autumn DST fall-back hour. Getting this
   wrong doesn't error, it silently overwrites an hour of readings once a year via the write path's

@@ -379,10 +379,15 @@ SCAN_COUNT = SCAN_END_ADDRESS - SCAN_START_ADDRESS + 1
 # counters); adding them means extending _ELEC_OBIS_MAP, not just the schema.
 TABLE_COLUMNS = {
     POSTGRES_TABLE: set(REGISTERS) | {"run_state"},
+    # Must stay in step with the deploying stack's schema: a name listed here is written as a real
+    # column, so adding one without the matching ALTER TABLE makes every insert fail. Apply the
+    # schema change *before* deploying an image that adds a field here -- old code ignores a column
+    # it doesn't know about, so that order is safe in a way the reverse isn't.
     ELEC_TABLE: {
         "electricity_delivered_1", "electricity_returned_1", "electricity_delivered_2",
         "electricity_returned_2", "electricity_currently_delivered",
         "electricity_currently_returned", "phase_voltage_l1",
+        "electricity_tariff", "phase_power_current_l1",
     },
     GAS_TABLE: {"delivered"},
     PLUG_TABLE: set(PLUG_FIELDS) | {"state"},
@@ -809,7 +814,21 @@ _ELEC_OBIS_MAP = {
     "1-0:1.7.0": "electricity_currently_delivered",
     "1-0:2.7.0": "electricity_currently_returned",
     "1-0:32.7.0": "phase_voltage_l1",
+    # Which tariff band the meter is currently registering to: 1 = low/off-peak, 2 = normal/peak.
+    # Worth having as its own column rather than inferring from the clock, which quietly goes wrong
+    # around DST and whenever the supplier's schedule changes. Note it says what the *meter* is
+    # doing, which is the thing that actually bills.
+    "0-0:96.14.0": "electricity_tariff",
+    # Actual amps on L1. Whole numbers only -- this meter reports 1 A resolution (confirmed against
+    # 30 days of history: 22 distinct values across a 1-22 A range), so it is useful for spotting a
+    # near-limit load, not for fine measurement.
+    "1-0:31.7.0": "phase_power_current_l1",
 }
+
+# Fields the meter reports as whole numbers and that are meaningless as floats -- a tariff band of
+# 2.0 groups and indexes worse than 2, and amps arrive at 1 A resolution anyway. Named to match
+# DSMR-reader's own columns for the same two values, both of which are integers there too.
+_ELEC_INT_FIELDS = {"electricity_tariff", "phase_power_current_l1"}
 
 
 def _parse_dsmr_timestamp(raw):
@@ -872,7 +891,9 @@ def parse_p1_telegram(text):
         if code == "0-0:1.0.0":
             elec_ts_ns = _parse_dsmr_timestamp(groups[0])
         elif code in _ELEC_OBIS_MAP:
-            elec[_ELEC_OBIS_MAP[code]] = _parse_dsmr_number(groups[0])
+            field = _ELEC_OBIS_MAP[code]
+            value = _parse_dsmr_number(groups[0])
+            elec[field] = int(value) if field in _ELEC_INT_FIELDS else value
         elif gas_channel is None and code.endswith(":24.1.0") and groups[0] == "003":
             gas_channel = code.split(":")[0].rsplit("-", 1)[1]
         elif gas_channel is not None and code == f"0-{gas_channel}:24.2.1" and len(groups) >= 2:

@@ -161,10 +161,31 @@ Each telegram is:
 1. **Framed and CRC-verified** (`extract_telegram`/`crc16_arc` in `app.py`) — a torn or corrupted
    read is logged and discarded rather than trusted, since a plausible-looking but wrong meter
    reading is worse than a gap.
-2. **Parsed by OBIS code** (`parse_p1_telegram`) into electricity fields (cumulative import/export
-   per tariff, instantaneous power, voltage) and, if present, a gas reading. The gas M-Bus channel
-   isn't assumed to be a fixed number — it's discovered per telegram by scanning for the
-   device-type-003 line, the same way DSMR-reader itself does.
+2. **Parsed by OBIS code** (`parse_p1_telegram`) into electricity fields and, if present, a gas
+   reading. The gas M-Bus channel isn't assumed to be a fixed number — it's discovered per telegram
+   by scanning for the device-type-003 line, the same way DSMR-reader itself does.
+
+   `_ELEC_OBIS_MAP` is a fixed allowlist; a code not in it is dropped here, before the write, so
+   adding a field is a code change rather than a schema one. What's mapped today:
+
+   | OBIS | Column | |
+   |---|---|---|
+   | `1-0:1.8.1` / `1-0:1.8.2` | `electricity_delivered_1` / `_2` | cumulative import per tariff, kWh |
+   | `1-0:2.8.1` / `1-0:2.8.2` | `electricity_returned_1` / `_2` | cumulative export per tariff, kWh |
+   | `1-0:1.7.0` / `1-0:2.7.0` | `electricity_currently_delivered` / `_returned` | instantaneous, kW |
+   | `1-0:32.7.0` | `phase_voltage_l1` | V |
+   | `0-0:96.14.0` | `electricity_tariff` | active band: 1 = low/off-peak, 2 = normal/peak |
+   | `1-0:31.7.0` | `phase_power_current_l1` | A, whole amps |
+
+   The last two are integers, not floats (`_ELEC_INT_FIELDS`) — the meter reports them that way and
+   they're stored in integer columns. `electricity_tariff` records what the *meter* was registering
+   to, which is what actually bills; deriving it from the clock instead goes quietly wrong around
+   DST and whenever a supplier changes its schedule. Current is 1 A resolution, so it's for spotting
+   a near-limit load rather than fine measurement.
+
+   Adding a field means extending `_ELEC_OBIS_MAP` **and** `TABLE_COLUMNS`, and adding the column to
+   the deploying stack's schema first — an image that writes a column the database doesn't have
+   fails every insert, whereas a column an older image doesn't know about is simply left NULL.
 3. **Cached in memory** for the PVOutput metrics (electricity only — see below) and **written to
    Postgres** (`ELEC_TABLE`/`GAS_TABLE`, default `electricity`/`gas_positions`).
 

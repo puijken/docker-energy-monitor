@@ -550,7 +550,9 @@ _P1_TELEGRAM_BODY = (
     "1-0:2.8.2(012199.498*kWh)\r\n"
     "1-0:1.7.0(00.417*kW)\r\n"
     "1-0:2.7.0(00.000*kW)\r\n"
+    "0-0:96.14.0(0002)\r\n"
     "1-0:32.7.0(235.0*V)\r\n"
+    "1-0:31.7.0(004*A)\r\n"
     "0-1:24.1.0(003)\r\n"
     "0-1:24.2.1(260812134400S)(06573.284*m3)\r\n"
     "!"
@@ -604,6 +606,11 @@ def check_p1_telegram_parsing(failures):
         "electricity_currently_delivered": 0.417,
         "electricity_currently_returned": 0.0,
         "phase_voltage_l1": 235.0,
+        # int, not float: the meter reports both as whole numbers and they are stored in integer
+        # columns. `== 2.0` would pass here even if the cast were dropped, so the types are
+        # asserted separately below.
+        "electricity_tariff": 2,
+        "phase_power_current_l1": 4,
     }
     expected_elec_ts_ns = app._parse_dsmr_timestamp("260812134420S")
     expected_gas_ts_ns = app._parse_dsmr_timestamp("260812134400S")
@@ -611,6 +618,14 @@ def check_p1_telegram_parsing(failures):
     elec, elec_ts_ns, gas = app.parse_p1_telegram(telegram)
     if elec != expected_elec:
         failures.append(f"  parse_p1_telegram() electricity: expected {expected_elec}, got {elec}")
+    # Python's 2 == 2.0, so equality above cannot tell an int from a float. These two land in
+    # smallint/integer columns and are grouped and filtered on, so the type is the point.
+    for field in sorted(app._ELEC_INT_FIELDS):
+        if field in elec and not isinstance(elec[field], int):
+            failures.append(
+                f"  parse_p1_telegram(): {field} is {type(elec[field]).__name__} "
+                f"({elec[field]!r}), expected int"
+            )
     if elec_ts_ns != expected_elec_ts_ns:
         failures.append(f"  parse_p1_telegram() electricity timestamp: expected {expected_elec_ts_ns}, got {elec_ts_ns}")
     if gas != (6573.284, expected_gas_ts_ns):

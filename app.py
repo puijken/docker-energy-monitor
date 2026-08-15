@@ -375,6 +375,17 @@ SCAN_START_ADDRESS = min(addr for addr, *_ in REGISTERS.values())
 SCAN_END_ADDRESS = max(addr + (1 if dtype in ("U32", "S32") else 0) for addr, dtype, *_ in REGISTERS.values())
 SCAN_COUNT = SCAN_END_ADDRESS - SCAN_START_ADDRESS + 1
 
+# What poll_inverter() actually returns, which is not the same set as REGISTERS and is what
+# MQTT_PUBLISH_FIELDS has to be validated against. Two deliberate differences, both easy to get
+# backwards -- validate_config previously did, in both directions at once:
+#   - work_state_1 is read but popped before returning, replaced by the decoded `run_state`. Naming
+#     it in MQTT_PUBLISH_FIELDS silently publishes nothing.
+#   - total_power_yields_precise is not a REGISTERS entry (it comes from the separate
+#     FINE_TOTAL_YIELD_REGISTER round trip) but is publishable. It is also best-effort: on a
+#     firmware without register 5144 it is simply absent, so it belongs here as accepted-but-not-
+#     guaranteed rather than being treated as always present.
+PUBLISHABLE_FIELDS = (set(REGISTERS) - {"work_state_1"}) | {"run_state", "total_power_yields_precise"}
+
 # Fixed columns per table, matching the Postgres schema the deploying stack creates (see its
 # timescaledb init SQL). A field not listed here for its table lands in that table's `extra`
 # JSONB column instead of failing the insert, so a new Zigbee2MQTT field needs no code change here
@@ -1167,7 +1178,11 @@ def queue_write(values, ts_ns, table, source):
     try:
         _write_queue.put_nowait(item)
     except queue.Full:
-        pass
+        # Only reachable if another producer refilled the slot between the get_nowait above and
+        # here. Log it separately: the warning above says the *oldest* point was dropped, which
+        # would be actively misleading here -- the point being dropped is the new one, and the
+        # old one that was evicted to make room is gone too.
+        log.warning("Postgres write queue still full after evicting; dropped the new point instead")
 
 
 def pg_writer_loop():
@@ -1191,6 +1206,15 @@ def pvoutput_loop():
     PVOutput's own day-total tracking during the PVOutput cutover. Same reasoning as
     mindergas_loop's wall-clock polling.
     """
+    if PVOUTPUT_INTERVAL <= 0:
+        # Guard rather than divide: 0 reads naturally as "disable", which is exactly what it means
+        # for P1_MIN_INTERVAL/PLUG_MIN_INTERVAL, and the bucket arithmetic below would otherwise
+        # raise ZeroDivisionError and take this thread down while the process stayed healthy.
+        log.warning(
+            "PVOUTPUT_INTERVAL is %s, so no PVOutput uploads will be sent. Unset ENABLE_PVOUTPUT "
+            "to disable this deliberately, or set a positive interval.", PVOUTPUT_INTERVAL
+        )
+        return
     last_bucket = int(time.time() // PVOUTPUT_INTERVAL)
     while True:
         time.sleep(1)
@@ -1418,13 +1442,23 @@ def validate_config():
             "lost, but the two are meant to be separable.", MQTT_TOPIC_PREFIX,
         )
 
-    unknown = MQTT_PUBLISH_FIELDS - set(REGISTERS) - {"run_state"}
+    # work_state_1 is excluded here because it gets its own, more specific warning below; leaving
+    # it in would report the same field twice under two different explanations.
+    unknown = MQTT_PUBLISH_FIELDS - PUBLISHABLE_FIELDS - {"work_state_1"}
     if unknown:
         log.warning(
             "MQTT_PUBLISH_FIELDS contains unknown field(s) %s -- they will never be published. "
             "Known fields: %s",
             ", ".join(sorted(unknown)),
-            ", ".join(sorted(set(REGISTERS) | {"run_state"})),
+            ", ".join(sorted(PUBLISHABLE_FIELDS)),
+        )
+    if "work_state_1" in MQTT_PUBLISH_FIELDS:
+        # Called out separately rather than lumped in with `unknown`: work_state_1 is a real
+        # register, so "unknown field" would be wrong and would send someone looking in the wrong
+        # place. It is simply the raw code, and poll_inverter replaces it with the decoded name.
+        log.warning(
+            "MQTT_PUBLISH_FIELDS contains work_state_1, which is never published -- it is decoded "
+            "into run_state before publishing. Use run_state instead."
         )
 
     if ENABLE_PVOUTPUT and not (PVOUTPUT_API_KEY and PVOUTPUT_SYSTEM_ID):

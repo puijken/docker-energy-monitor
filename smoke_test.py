@@ -151,25 +151,44 @@ def serve():
     StartTcpServer(context=context, address=("127.0.0.1", PORT))
 
 
-def check_modbus_poll(failures):
-    """Original coverage: decode registers through app.poll_inverter() against a real pymodbus
-    server, plus the physical-invariant and line-protocol-formatting checks that rely on it."""
-    threading.Thread(target=serve, daemon=True).start()
+_inverter_server_started = False
 
+
+def _poll_against_fake_inverter():
+    """One poll against the fake inverter, starting the server on first use.
+
+    Shared so a check can poll without depending on check_modbus_poll having run first -- an
+    ordering dependency between checks has already caused one assertion here to silently never run.
+    Returns None if the server can't be reached.
+    """
+    global _inverter_server_started
     from pymodbus.client import ModbusTcpClient
 
+    if not _inverter_server_started:
+        threading.Thread(target=serve, daemon=True).start()
+        _inverter_server_started = True
+        time.sleep(0.5)  # let it bind first, so the log isn't cluttered with a refused connect
+
     client = ModbusTcpClient("127.0.0.1", port=PORT, timeout=5)
-    time.sleep(0.5)  # let the server bind first, so the log isn't cluttered with a refused connect
     for _ in range(30):
         if client.connect():
             break
         time.sleep(0.5)
     else:
+        return None
+    try:
+        return app.poll_inverter(client)
+    finally:
+        client.close()
+
+
+def check_modbus_poll(failures):
+    """Original coverage: decode registers through app.poll_inverter() against a real pymodbus
+    server, plus the physical-invariant and line-protocol-formatting checks that rely on it."""
+    values = _poll_against_fake_inverter()
+    if values is None:
         failures.append("  could not connect to the test inverter")
         return
-
-    values = app.poll_inverter(client)
-    client.close()
 
     for name, want in EXPECTED.items():
         got = values.get(name)
@@ -1082,6 +1101,90 @@ def check_telegram_buffer_cap(failures):
     print("  telegram buffer cap: chunked telegram still reassembles across recv() boundaries")
 
 
+def check_publishable_fields(failures):
+    """PUBLISHABLE_FIELDS must match what poll_inverter() actually returns.
+
+    validate_config used to check MQTT_PUBLISH_FIELDS against REGISTERS, which is wrong in both
+    directions at once: it accepted work_state_1 (popped before publishing, so naming it publishes
+    nothing, silently) and warned "unknown" for total_power_yields_precise (publishable, but not a
+    REGISTERS entry). Asserted against a real poll rather than by restating the set, so the two drift
+    apart in CI rather than in a deployment.
+    """
+    values = _poll_against_fake_inverter()
+    if values is None:
+        failures.append("  PUBLISHABLE_FIELDS: could not poll the fake inverter to compare against")
+        return
+
+    # total_power_yields_precise is best-effort (separate round trip, absent on firmware without
+    # register 5144), so it is allowed to be in PUBLISHABLE_FIELDS without appearing in a poll.
+    missing = set(values) - app.PUBLISHABLE_FIELDS
+    extra = app.PUBLISHABLE_FIELDS - set(values) - {"total_power_yields_precise"}
+    if missing:
+        failures.append(
+            f"  PUBLISHABLE_FIELDS is missing field(s) poll_inverter() returns: "
+            f"{', '.join(sorted(missing))} -- validate_config would warn 'unknown' for a real field"
+        )
+    if extra:
+        failures.append(
+            f"  PUBLISHABLE_FIELDS claims field(s) poll_inverter() never returns: "
+            f"{', '.join(sorted(extra))} -- validate_config would accept a field that publishes nothing"
+        )
+    if missing or extra:
+        return
+
+    if "work_state_1" in app.PUBLISHABLE_FIELDS:
+        failures.append("  PUBLISHABLE_FIELDS contains work_state_1, which is popped before publishing")
+        return
+    if "run_state" not in app.PUBLISHABLE_FIELDS:
+        failures.append("  PUBLISHABLE_FIELDS is missing run_state, the decoded replacement for work_state_1")
+        return
+    print(f"  publishable fields: {len(app.PUBLISHABLE_FIELDS)} fields match poll_inverter()'s real "
+          "output (work_state_1 excluded, total_power_yields_precise included)")
+
+
+def check_pvoutput_interval_guard(failures):
+    """pvoutput_loop() must not divide by PVOUTPUT_INTERVAL before checking it.
+
+    0 reads naturally as "disable" -- it means exactly that for P1_MIN_INTERVAL/PLUG_MIN_INTERVAL --
+    but the bucket arithmetic raised ZeroDivisionError and killed the thread while the process
+    stayed healthy: container Up, no uploads, no obvious cause.
+    """
+    original = app.PVOUTPUT_INTERVAL
+    try:
+        for value in (0, -1):
+            app.PVOUTPUT_INTERVAL = value
+            done = threading.Event()
+            error = []
+
+            def run():
+                try:
+                    app.pvoutput_loop()
+                except Exception as exc:  # noqa: BLE001 -- the point is to catch ZeroDivisionError
+                    error.append(exc)
+                finally:
+                    done.set()
+
+            threading.Thread(target=run, daemon=True).start()
+            # A correct implementation returns immediately; the buggy one raises immediately. Either
+            # way this does not wait the full timeout, which only guards against a loop that spins.
+            if not done.wait(5):
+                failures.append(
+                    f"  pvoutput_loop(): did not return with PVOUTPUT_INTERVAL={value}; it should "
+                    "warn and stop rather than run"
+                )
+                return
+            if error:
+                failures.append(
+                    f"  pvoutput_loop(): PVOUTPUT_INTERVAL={value} raised "
+                    f"{type(error[0]).__name__}: {error[0]} -- it should warn and return instead"
+                )
+                return
+    finally:
+        app.PVOUTPUT_INTERVAL = original
+    print("  pvoutput interval guard: PVOUTPUT_INTERVAL=0/-1 warns and stops the thread cleanly "
+          "instead of raising ZeroDivisionError")
+
+
 def check_log_level(failures):
     """app.resolve_log_level(): default WARNING for a minimal-logging production run, any of the
     five standard names case-insensitively, and a safe fallback (with a warning, not a crash) on
@@ -1329,6 +1432,8 @@ def main():
     check_derived_fields(failures)
     check_solar_stale_fallback(failures)
     check_telegram_buffer_cap(failures)
+    check_publishable_fields(failures)
+    check_pvoutput_interval_guard(failures)
     check_log_level(failures)
 
     signal.alarm(0)
@@ -1341,7 +1446,7 @@ def main():
     print("smoke test passed: modbus, mqtt connect, mqtt publish switch, postgres write, postgres read, P1 telegram parsing, "
           "P1 relay broadcast, P1 stall reconnect, plug parsing, DSMR timestamps (incl. DST fall-back), "
           "smart-meter source stability, pvoutput metrics, derived fields, solar staleness fallback, "
-          "log level")
+          "telegram buffer cap, publishable fields, pvoutput interval guard, log level")
     return 0
 
 

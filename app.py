@@ -165,6 +165,15 @@ P1_WARN_AFTER = env_int("P1_WARN_AFTER", 60)
 # plausible gap between telegrams -- at ~1/s, three minutes of nothing is not jitter. 0 disables
 # the reconnect and restores the old warn-and-wait-forever behaviour; don't.
 P1_STALL_TIMEOUT = env_int("P1_STALL_TIMEOUT", 180) or float("inf")
+# Upper bound on the partial-telegram buffer extract_telegram may retain. Only ever consulted when
+# a telegram start has been seen and no valid terminator follows it, so it costs nothing in normal
+# operation: a real telegram off this meter is 723 bytes and the reader drains every *complete* one
+# before anything is retained, leaving only a trailing fragment. 64 KB is therefore ~90 telegrams of
+# slack -- reaching it means roughly a minute and a half of a stream that starts telegrams and never
+# finishes them (ser2net at the wrong baud, or the port repointed at a non-DSMR device), which
+# without a cap grows without limit in a container that has no mem_limit. Not env-configurable on
+# purpose: there is no deployment where tuning this is the right answer.
+P1_MAX_BUFFER_BYTES = 65536
 # Re-serves the raw P1 byte stream to any number of downstream TCP clients (e.g. DSMR-reader),
 # making this container the one and only real client of the upstream relay/ser2net -- see the
 # ENABLE_P1 comment above for why that matters. Each connected client gets every byte this
@@ -782,6 +791,20 @@ def extract_telegram(buffer):
 
     match = _TELEGRAM_END_RE.search(buffer)
     if not match:
+        if len(buffer) > P1_MAX_BUFFER_BYTES:
+            # Everything here is unparseable by definition -- a telegram start with no terminator
+            # for P1_MAX_BUFFER_BYTES. Dropping all of it rather than keeping a tail from the last
+            # "/" is deliberate: on a garbage stream "/" occurs about every 256 bytes, so a tail
+            # would just refill, and on a stream that recovers the next telegram resyncs within a
+            # second anyway. Worst case is losing one in-flight telegram at the boundary, in a
+            # situation that is already producing no data. The relay is unaffected -- it broadcasts
+            # each raw chunk before this buffer is ever touched.
+            log.warning(
+                "Discarding %d bytes of P1 data: telegram start seen but no valid terminator "
+                "within %d bytes. Check the upstream is really a DSMR meter at the right baud.",
+                len(buffer), P1_MAX_BUFFER_BYTES,
+            )
+            return None, b""
         return None, buffer
 
     telegram = buffer[: match.end()]

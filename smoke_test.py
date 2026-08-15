@@ -1031,6 +1031,57 @@ def check_smart_meter_source_is_stable(failures):
     print("  smart-meter source label: stable at 'dsmr' (history stays continuous)")
 
 
+def check_telegram_buffer_cap(failures):
+    """extract_telegram() must not retain an unbounded partial-telegram buffer.
+
+    A stream containing a telegram start but never a valid `!<4 hex>\\r\\n` terminator (ser2net at
+    the wrong baud, or the port repointed at a non-DSMR device) used to be retained in full, growing
+    without limit in a container with no mem_limit. Three separate things are asserted, because a
+    cap that merely bounds memory while breaking normal parsing would be worse than the leak.
+    """
+    # 1. Unterminated garbage is bounded, not retained.
+    buffer = b""
+    for _ in range(400):  # ~100 KB, comfortably past the 64 KB cap
+        _, buffer = app.extract_telegram(buffer + b"/junk" + b"x" * 250)
+        if len(buffer) > app.P1_MAX_BUFFER_BYTES:
+            failures.append(
+                f"  extract_telegram(): buffer grew to {len(buffer)} bytes, above the "
+                f"{app.P1_MAX_BUFFER_BYTES}-byte cap"
+            )
+            return
+    print(f"  telegram buffer cap: unterminated stream bounded at {len(buffer)} bytes "
+          f"(cap {app.P1_MAX_BUFFER_BYTES}, was unbounded)")
+
+    # 2. A real telegram still parses -- the cap must be nowhere near a legitimate one.
+    telegram = _p1_telegram_bytes()
+    parsed, remaining = app.extract_telegram(telegram)
+    if parsed is None:
+        failures.append("  extract_telegram(): a valid telegram no longer parses after the cap change")
+        return
+    if len(telegram) > app.P1_MAX_BUFFER_BYTES // 4:
+        failures.append(
+            f"  extract_telegram(): cap {app.P1_MAX_BUFFER_BYTES} leaves too little headroom over a "
+            f"{len(telegram)}-byte telegram"
+        )
+        return
+    print(f"  telegram buffer cap: {len(telegram)}-byte telegram still parses "
+          f"({app.P1_MAX_BUFFER_BYTES // len(telegram)}x headroom)")
+
+    # 3. A telegram split across recv() boundaries must survive. This is the assertion that would
+    #    catch a cap applied on the wrong branch (e.g. clearing the buffer whenever no complete
+    #    telegram is present yet), which would silently discard every telegram forever.
+    buffer = b""
+    for i in range(0, len(telegram), 250):
+        parsed, buffer = app.extract_telegram(buffer + telegram[i:i + 250])
+    if parsed is None:
+        failures.append(
+            "  extract_telegram(): a telegram arriving in 250-byte chunks no longer reassembles -- "
+            "the cap is discarding partial telegrams mid-flight"
+        )
+        return
+    print("  telegram buffer cap: chunked telegram still reassembles across recv() boundaries")
+
+
 def check_log_level(failures):
     """app.resolve_log_level(): default WARNING for a minimal-logging production run, any of the
     five standard names case-insensitively, and a safe fallback (with a warning, not a crash) on
@@ -1277,6 +1328,7 @@ def main():
     check_pvoutput_metrics(failures)
     check_derived_fields(failures)
     check_solar_stale_fallback(failures)
+    check_telegram_buffer_cap(failures)
     check_log_level(failures)
 
     signal.alarm(0)

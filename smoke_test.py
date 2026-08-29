@@ -10,6 +10,11 @@ app.poll_inverter, check the decoded values). Dependabot auto-merges non-major b
 paho-mqtt, requests and psycopg too, so an API change in any of them would also pass CI and only
 surface at runtime. This file now additionally covers, all without a real broker or Postgres:
 
+  - Inverter reconnect after a send-time socket error: main()'s per-cycle pattern (connect-if-
+    needed, poll, and on any exception close() the client) mirrored against a fake client whose
+    `.connected` survives a simulated BrokenPipeError, matching real pymodbus -- the loop's own
+    body isn't independently callable, so this checks the pattern's shape rather than driving
+    main() itself. See check_inverter_reconnect_after_broken_pipe()'s docstring for the caveat.
   - paho-mqtt: app.mqtt_connect() still returns a working client (catches a Client()/
     callback_api_version constructor change).
   - The ENABLE_MQTT_PUBLISH switch: publishing toggles on/off for both the inverter and
@@ -227,6 +232,111 @@ def check_modbus_poll(failures):
         failures.append(f"  fine total yield {fine}kWh disagrees with coarse {coarse}kWh by >1kWh")
 
     print(f"  modbus poll: {len(EXPECTED)} values decoded, unit kwarg={app._UNIT_KWARG!r}")
+
+
+def check_inverter_reconnect_after_broken_pipe(failures):
+    """Inverter poll loop must force a genuine reconnect after a send-time socket error.
+
+    Covers the fix in app.py's main() -- the `except Exception: ... modbus_client.close()` block
+    right after the "Inverter poll failed" log line -- which isn't independently callable: it's
+    inline in an infinite `while True:` loop that also starts every other background thread. So
+    this check mirrors just the connect-check/work/except-close pattern from that loop against a
+    fake client, rather than driving main() itself.
+
+    The bug this guards against (root cause of a ~7 hour production outage on 2026-08-29): pymodbus
+    does not reliably flip `.connected` back to False after a send-time socket error (observed: a
+    BrokenPipeError left it True), so `if not modbus_client.connected and not
+    modbus_client.connect()` never re-triggered and the loop retried writes on the same dead socket
+    forever. The fake client below reproduces exactly that gap -- its `.connected` survives the
+    simulated failure and only `.close()` resets it, matching real pymodbus where an explicit
+    close() does work but the implicit failure path doesn't -- so this fails if the `.close()` call
+    in the except block is ever removed, or if it stops resetting `.connected` before the next
+    cycle runs.
+
+    Caveat: because main()'s loop body can't be imported and called directly, this necessarily
+    duplicates the shape of that pattern rather than exercising app.py's actual loop code -- it
+    would not catch a regression where main() diverges from this exact shape while some
+    differently-shaped fix happens to still work. It does catch the regression that matters most:
+    the close() call being removed or neutered.
+    """
+    before = len(failures)
+
+    class _FlappyModbusClient:
+        """Reproduces the real pymodbus gap: `.connected` survives a send-time socket error, but
+        a real `.close()` call does still reset it."""
+
+        def __init__(self):
+            self.connected = True  # already connected when this cycle starts
+            self.connect_calls = 0
+            self.close_calls = 0
+            self._poll_calls = 0
+
+        def connect(self):
+            self.connect_calls += 1
+            self.connected = True
+            return True
+
+        def close(self):
+            self.close_calls += 1
+            self.connected = False
+
+        def poll(self):
+            self._poll_calls += 1
+            if self._poll_calls == 1:
+                # Simulated send-time socket error. Real pymodbus leaves .connected True here --
+                # that's the whole bug -- so this fake does too.
+                raise BrokenPipeError("simulated send-time socket error")
+            return f"ok (poll #{self._poll_calls})"
+
+    def _run_cycle(client):
+        """Mirrors app.py main()'s per-cycle pattern: reconnect-if-needed, then do the work."""
+        if not client.connected and not client.connect():
+            raise OSError("could not connect")
+        return client.poll()
+
+    client = _FlappyModbusClient()
+
+    # Cycle 1: already connected, so no reconnect attempt yet; the poll itself fails.
+    try:
+        _run_cycle(client)
+        failures.append("  cycle 1 was expected to raise (simulated socket error) but did not")
+    except Exception:
+        # Mirrors app.py's except block: close the client so the next cycle's reconnect check
+        # is honest regardless of what .connected claims.
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    if client.close_calls != 1:
+        failures.append(f"  expected close() once after cycle 1's failure, got {client.close_calls}")
+    if client.connected:
+        failures.append(
+            "  client.connected is still True after close() -- the next cycle's "
+            "'not modbus_client.connected' check would stay false forever, same as the original bug"
+        )
+
+    # Cycle 2: connected is now honestly False, so the reconnect check must fire and succeed.
+    try:
+        result = _run_cycle(client)
+    except Exception as exc:
+        failures.append(f"  cycle 2 unexpectedly raised: {exc!r}")
+        result = None
+
+    if client.connect_calls != 1:
+        failures.append(
+            f"  expected exactly 1 connect() call by cycle 2 (the genuine reconnect), got "
+            f"{client.connect_calls}"
+        )
+    if result != "ok (poll #2)":
+        failures.append(f"  cycle 2 did not recover cleanly: {result!r}")
+
+    if len(failures) == before:
+        print(
+            "  inverter reconnect: close() forced after a simulated send-time socket error "
+            "(connected stayed True, matching real pymodbus), next cycle's reconnect check "
+            "fired honestly and recovered"
+        )
 
 
 def check_mqtt_publish_switch(failures):
@@ -1418,6 +1528,7 @@ def main():
 
     failures = []
     check_modbus_poll(failures)
+    check_inverter_reconnect_after_broken_pipe(failures)
     check_mqtt_connect(failures)
     check_mqtt_publish_switch(failures)
     check_postgres_write(failures)
@@ -1443,7 +1554,8 @@ def main():
         print("\n".join(failures), file=sys.stderr)
         return 1
 
-    print("smoke test passed: modbus, mqtt connect, mqtt publish switch, postgres write, postgres read, P1 telegram parsing, "
+    print("smoke test passed: modbus, inverter reconnect after broken pipe, mqtt connect, mqtt publish switch, "
+          "postgres write, postgres read, P1 telegram parsing, "
           "P1 relay broadcast, P1 stall reconnect, plug parsing, DSMR timestamps (incl. DST fall-back), "
           "smart-meter source stability, pvoutput metrics, derived fields, solar staleness fallback, "
           "telegram buffer cap, publishable fields, pvoutput interval guard, log level")

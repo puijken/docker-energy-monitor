@@ -1624,6 +1624,18 @@ def main():
                     log.exception("MQTT publish failed")
         except Exception:
             log.exception("Inverter poll failed")
+            # pymodbus does not reliably flip `.connected` back to False after a send-time
+            # socket error (observed: BrokenPipeError leaves it True), so the `not
+            # modbus_client.connected` check above would otherwise never trip again and this
+            # loop would retry writes on the same dead socket forever -- seen in production
+            # retrying every SCAN_INTERVAL for hours until a manual restart. Explicitly closing
+            # here forces a genuine reconnect attempt next cycle regardless of what `.connected`
+            # claims. close() on an already-broken socket is itself allowed to raise; that's not
+            # a new failure worth surfacing since we're already handling one.
+            try:
+                modbus_client.close()
+            except Exception:
+                pass
 
         # Sleep only for the remainder of the interval, so the cadence stays SCAN_INTERVAL rather
         # than SCAN_INTERVAL plus however long the work took.

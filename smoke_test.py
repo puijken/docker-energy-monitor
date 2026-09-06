@@ -55,6 +55,11 @@ surface at runtime. This file now additionally covers, all without a real broker
     grant concurrent access to one serial device (see the ENABLE_P1 comment in app.py).
   - The PVOutput metric formulas in app.METRICS, and that build_pvoutput_params() degrades to
     inverter-only output when no electricity data is cached.
+  - The daily-generation-yield correction (app._daily_generation_wh_corrected(), for
+    daily_power_yields periodically failing to reset at local midnight): a cached baseline is used
+    without touching Postgres, a cache miss queries and caches app.get_daily_yield_baseline(), and
+    both a missing baseline row and PVOUTPUT_USE_RAW_DAILY_YIELD=True fall back to the raw
+    register.
 
 Run with no arguments; exits non-zero on the first failed expectation. Guarded by an overall
 wall-clock timeout so a hang in any check (e.g. a client that doesn't disconnect cleanly) fails
@@ -1493,9 +1498,15 @@ def check_pvoutput_metrics(failures):
     orig_mapping = dict(app.PVOUTPUT_MAPPING)
     orig_enable_p1 = app.ENABLE_P1
     orig_elec_cache = app._elec_cache
+    orig_use_raw_daily_yield = app.PVOUTPUT_USE_RAW_DAILY_YIELD
     app.ENABLE_P1 = True
     app._elec_cache = None
     app.PVOUTPUT_MAPPING = {"v1": "daily_generation_wh", "v3": "house_power_w"}
+    # daily_generation_wh's own Postgres-backed baseline lookup is covered separately in
+    # check_daily_generation_wh_corrected() -- pin it to the raw-register path here so this check
+    # stays what it's testing (the electricity-cache degrade) and doesn't also depend on mocking
+    # psycopg.connect.
+    app.PVOUTPUT_USE_RAW_DAILY_YIELD = True
     try:
         params = app.build_pvoutput_params(inverter)
         if "v3" in params:
@@ -1509,11 +1520,100 @@ def check_pvoutput_metrics(failures):
         app.PVOUTPUT_MAPPING = orig_mapping
         app.ENABLE_P1 = orig_enable_p1
         app._elec_cache = orig_elec_cache
+        app.PVOUTPUT_USE_RAW_DAILY_YIELD = orig_use_raw_daily_yield
 
     if len(failures) == before:
         print(
             "  pvoutput metrics: house_power_w/total_house_energy_wh correct; "
             "degrades to inverter-only without P1 electricity data"
+        )
+
+
+def check_daily_generation_wh_corrected(failures):
+    """app._daily_generation_wh_corrected() -- the fix for daily_power_yields periodically failing
+    to reset at local midnight on this inverter (see README's "Solar daily yield" section).
+
+    Covers all four paths: a cache hit never touches Postgres at all (psycopg.connect is
+    monkeypatched to raise if called, so a regression that dropped the cache check would fail
+    loudly rather than just being slower); a cache miss queries get_daily_yield_baseline() and
+    populates the cache for next time; a cache miss with no row at all falls back to the raw
+    register; and PVOUTPUT_USE_RAW_DAILY_YIELD=True bypasses all of the above unconditionally.
+    """
+    before = len(failures)
+    today = datetime.now().astimezone().date()
+    orig_baseline = app._daily_yield_baseline
+    orig_use_raw = app.PVOUTPUT_USE_RAW_DAILY_YIELD
+    orig_connect = app.psycopg.connect
+
+    def _explode(**kwargs):
+        raise AssertionError("psycopg.connect() should not have been called")
+
+    try:
+        # 1. Cache hit: today's baseline is already cached, so this must use it directly and
+        #    never touch Postgres. Prefers total_power_yields_precise over total_power_yields on
+        #    the "current" side, matching the same preference get_daily_yield_baseline applies to
+        #    the baseline side.
+        app.PVOUTPUT_USE_RAW_DAILY_YIELD = False
+        app._daily_yield_baseline = (today, 27130.0)
+        app.psycopg.connect = _explode
+        inverter = {
+            "daily_power_yields": 999.9,  # deliberately implausible, to prove this path is unused
+            "total_power_yields": 27135,
+            "total_power_yields_precise": 27134.7,
+        }
+        # (27134.7 - 27130.0) * 1000 = 4700
+        expected = 4700
+        got = app._daily_generation_wh_corrected(inverter)
+        if got != expected:
+            failures.append(f"  daily_generation_wh_corrected() cache hit: expected {expected}, got {got}")
+
+        # 2. Cache miss, Postgres has a row: must query get_daily_yield_baseline(), use its
+        #    result, and populate the cache with today's date for next time.
+        app._daily_yield_baseline = None
+        canned_row = (27130, 27130.0)
+        app.psycopg.connect = lambda **kwargs: _FakeConnection(fetch_result=canned_row)
+        got = app._daily_generation_wh_corrected(inverter)
+        if got != expected:
+            failures.append(f"  daily_generation_wh_corrected() cache miss (row found): expected {expected}, got {got}")
+        if app._daily_yield_baseline != (today, 27130.0):
+            failures.append(
+                f"  daily_generation_wh_corrected() didn't cache the fetched baseline for today: "
+                f"{app._daily_yield_baseline!r}"
+            )
+
+        # 3. Cache miss, Postgres has no row at all (e.g. a genuine gap in our own polling right
+        #    around some past midnight): must fall back to the raw register rather than dropping
+        #    the upload.
+        app._daily_yield_baseline = None
+        app.psycopg.connect = lambda **kwargs: _FakeConnection(fetch_result=None)
+        expected_fallback = round(inverter["daily_power_yields"] * 1000)
+        got = app._daily_generation_wh_corrected(inverter)
+        if got != expected_fallback:
+            failures.append(
+                f"  daily_generation_wh_corrected() cache miss (no row): expected fallback "
+                f"{expected_fallback}, got {got}"
+            )
+
+        # 4. The escape hatch: must bypass all of the above unconditionally, without even
+        #    checking the cache first.
+        app.PVOUTPUT_USE_RAW_DAILY_YIELD = True
+        app._daily_yield_baseline = None
+        app.psycopg.connect = _explode
+        got = app._daily_generation_wh_corrected(inverter)
+        if got != expected_fallback:
+            failures.append(
+                f"  daily_generation_wh_corrected() PVOUTPUT_USE_RAW_DAILY_YIELD=True: "
+                f"expected {expected_fallback}, got {got}"
+            )
+    finally:
+        app._daily_yield_baseline = orig_baseline
+        app.PVOUTPUT_USE_RAW_DAILY_YIELD = orig_use_raw
+        app.psycopg.connect = orig_connect
+
+    if len(failures) == before:
+        print(
+            "  daily_generation_wh_corrected: cache hit skips Postgres, cache miss queries and "
+            "caches it, no-row and PVOUTPUT_USE_RAW_DAILY_YIELD both fall back to the raw register"
         )
 
 
@@ -1540,6 +1640,7 @@ def main():
     check_dsmr_timestamp_parsing(failures)
     check_smart_meter_source_is_stable(failures)
     check_pvoutput_metrics(failures)
+    check_daily_generation_wh_corrected(failures)
     check_derived_fields(failures)
     check_solar_stale_fallback(failures)
     check_telegram_buffer_cap(failures)
@@ -1557,7 +1658,8 @@ def main():
     print("smoke test passed: modbus, inverter reconnect after broken pipe, mqtt connect, mqtt publish switch, "
           "postgres write, postgres read, P1 telegram parsing, "
           "P1 relay broadcast, P1 stall reconnect, plug parsing, DSMR timestamps (incl. DST fall-back), "
-          "smart-meter source stability, pvoutput metrics, derived fields, solar staleness fallback, "
+          "smart-meter source stability, pvoutput metrics, daily generation yield correction, "
+          "derived fields, solar staleness fallback, "
           "telegram buffer cap, publishable fields, pvoutput interval guard, log level")
     return 0
 

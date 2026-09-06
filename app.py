@@ -287,6 +287,15 @@ PVOUTPUT_CUMULATIVE_FLAG = env_int("PVOUTPUT_CUMULATIVE_FLAG", 0)
 # Don't upload a reading older than this -- otherwise a stalled Modbus connection would keep
 # re-posting the last known value stamped with the current time.
 PVOUTPUT_MAX_DATA_AGE = env_int("PVOUTPUT_MAX_DATA_AGE", 600)
+# daily_power_yields (register 5003, "yield so far today") periodically fails to reset to 0 at
+# local midnight on this inverter -- confirmed against a year of iSolarCloud exports, see the
+# README's "Solar daily yield" section -- and when that happens it silently inflates every v1
+# upload for the rest of the stuck streak (PVOutput eventually rejects the more extreme ones, e.g.
+# "too high for 10:00" or "Moon powered", but plenty of smaller-margin ones go through unrejected).
+# The dashboards were already fixed by diffing the lifetime counter (total_power_yields) instead;
+# this makes the live PVOutput push do the same rather than trusting the raw register. Escape
+# hatch only, not a real setting to reach for -- see _daily_generation_wh_corrected below.
+PVOUTPUT_USE_RAW_DAILY_YIELD = env_bool("PVOUTPUT_USE_RAW_DAILY_YIELD", False)
 
 ENABLE_MINDERGAS = env_bool("ENABLE_MINDERGAS", False)
 MINDERGAS_API_KEY = env("MINDERGAS_API_KEY")
@@ -432,7 +441,10 @@ def _e(elec, field):
 # usable even if writes are failing. `e` is None (never accessed) when the metric doesn't need it.
 METRICS = {
     # --- inverter only (always available) ---
-    "daily_generation_wh": (False, lambda i, e: round(i["daily_power_yields"] * 1000)),
+    # See _daily_generation_wh_corrected() and PVOUTPUT_USE_RAW_DAILY_YIELD above: daily_power_yields
+    # (the raw register) periodically fails to reset at midnight, so this diffs the lifetime
+    # counter against a locally-tracked midnight baseline instead of trusting it directly.
+    "daily_generation_wh": (False, lambda i, e: _daily_generation_wh_corrected(i)),
     "total_generation_wh": (False, lambda i, e: round(i["total_power_yields"] * 1000)),
     "generation_w": (False, lambda i, e: i["total_active_power"]),
     "dc_power_w": (False, lambda i, e: i["total_dc_power"]),
@@ -500,6 +512,14 @@ _mqtt_client = None
 # build_pvoutput_params/derived_fields, written only by p1_reader_loop's own thread.
 _elec_lock = threading.Lock()
 _elec_cache = None
+
+# Today's local-midnight total_power_yields baseline, as (local_date, baseline_kwh), read/written
+# by _daily_generation_wh_corrected() from the pvoutput_loop thread. Refreshed lazily -- the cached
+# date just has to stop matching "today" for a new query to fire -- rather than on a timer, so a
+# missed refresh at exactly midnight self-heals on the very next PVOutput push instead of running
+# a whole day on a stale baseline.
+_daily_yield_lock = threading.Lock()
+_daily_yield_baseline = None
 # Monotonic time of the last electricity Postgres write, for P1_MIN_INTERVAL throttling. Owned
 # solely by p1_reader_loop's thread -- no lock needed.
 _last_elec_write_time = 0.0
@@ -662,6 +682,86 @@ def get_last_gas_reading(before):
                 (before,),
             )
             return cur.fetchone()
+
+
+def get_daily_yield_baseline(before):
+    """(total_power_yields, total_power_yields_precise-or-None) of the last "sungrow"-sourced row
+    in POSTGRES_TABLE strictly before `before` (a local midnight), or None if there isn't one.
+
+    This is yesterday's final lifetime-yield reading, which is the same thing as today's starting
+    point since total_power_yields is continuous across midnight -- see
+    _daily_generation_wh_corrected() below, and the README's "Solar daily yield" section for why
+    this reads the lifetime counter instead of trusting daily_power_yields (which periodically
+    fails to reset). No lower bound, same reasoning as get_last_gas_reading: a genuine gap in our
+    own polling right around midnight should still resolve against the last real reading, however
+    far back it is, rather than giving up. `source` is pinned to "sungrow" so a backfill/gapfill
+    row (see backfill.py) is never picked as the baseline. Opens a short-lived connection rather
+    than sharing the writer thread's persistent one -- this is refreshed at most once a day, from
+    pvoutput_loop's thread."""
+    with psycopg.connect(
+        host=POSTGRES_HOST, port=POSTGRES_PORT, dbname=POSTGRES_DB,
+        user=POSTGRES_USER, password=POSTGRES_PASSWORD,
+    ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT total_power_yields, (extra->>'total_power_yields_precise')::double precision "
+                f"FROM {POSTGRES_TABLE} WHERE time < %s AND source = %s ORDER BY time DESC LIMIT 1",
+                (before, "sungrow"),
+            )
+            return cur.fetchone()
+
+
+def _daily_generation_wh_corrected(inverter_values):
+    """daily_generation_wh for PVOutput's v1, computed as (today's lifetime yield) - (yesterday's
+    final lifetime yield) instead of trusting daily_power_yields directly.
+
+    Prefers total_power_yields_precise (the 0.1 kWh-scaled twin) over total_power_yields (whole
+    kWh only -- see the README's "take two" section) for both today's value and the baseline, so a
+    day this small doesn't inherit the 1 kWh quantization step; falls back to total_power_yields on
+    either side if the precise read is missing (it's polled as an optional second round trip, see
+    poll_inverter). The baseline is cached per local day rather than looked up on every push, and
+    refreshed lazily -- see _daily_yield_baseline above.
+
+    Falls back to the raw register entirely if no baseline can be found at all (a genuine gap in
+    our own polling right around some past midnight -- get_daily_yield_baseline returning None),
+    trading the known reset bug for an upload rather than losing this push completely.
+    """
+    global _daily_yield_baseline
+    if PVOUTPUT_USE_RAW_DAILY_YIELD:
+        return round(inverter_values["daily_power_yields"] * 1000)
+
+    now_local = datetime.now().astimezone()
+    today = now_local.date()
+    with _daily_yield_lock:
+        cached = _daily_yield_baseline
+
+    if cached is None or cached[0] != today:
+        local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        try:
+            row = get_daily_yield_baseline(local_midnight)
+        except Exception:
+            log.exception("Could not fetch daily-yield baseline; falling back to the raw register")
+            row = None
+        if row is None:
+            log.warning(
+                "No solar row found before %s to use as a daily-yield baseline; "
+                "falling back to the raw daily_power_yields register",
+                local_midnight,
+            )
+            return round(inverter_values["daily_power_yields"] * 1000)
+        baseline_total, baseline_precise = row
+        cached = (today, baseline_precise if baseline_precise is not None else baseline_total)
+        with _daily_yield_lock:
+            _daily_yield_baseline = cached
+
+    _, baseline = cached
+    current = inverter_values.get("total_power_yields_precise")
+    if current is None:
+        current = inverter_values["total_power_yields"]
+    # max(0, ...) guards a boundary jitter (baseline read a few seconds into the next day, or a
+    # brief post-midnight dip before the diff catches up) rather than ever uploading negative
+    # generation.
+    return round(max(0.0, current - baseline) * 1000)
 
 
 def publish_mqtt(mqtt_client, values, prefix, fields=None):

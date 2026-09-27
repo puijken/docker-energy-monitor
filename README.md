@@ -65,7 +65,7 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `POSTGRES_USER` | *required* | Database user |
 | `POSTGRES_PASSWORD` | *required* | Database password |
 | `POSTGRES_TABLE` | `solar` | Table name written to for inverter readings |
-| `WRITE_QUEUE_SIZE` | `2000` | Max points buffered for the Postgres writer thread. A prolonged outage drops the oldest queued point first rather than growing without bound. |
+| `WRITE_QUEUE_SIZE` | `2000` | Max points buffered for the Postgres writer thread. While the database is unreachable the writer holds its current point and retries (1 s → 30 s backoff), so this queue is what bridges the outage; at a few points per second the default covers roughly half an hour. Past that the oldest queued point is dropped first rather than growing without bound. A point the database *rejects* (bad data, unknown column) is logged and dropped at once, so it can't block the ones behind it. |
 | `MQTT_HOST` | *required if MQTT is used* | Broker hostname/IP. Only required when `ENABLE_MQTT_PUBLISH` or `ENABLE_PLUGS` is on; with both off the container never connects to a broker at all. |
 | `MQTT_PORT` | `1883` | MQTT broker port |
 | `MQTT_USERNAME` | *(none)* | MQTT username, if required |
@@ -440,6 +440,9 @@ decode path and has grown alongside the features above:
 - **Postgres write and read paths**: `app.write_postgres()` / `app.get_last_gas_reading()` against
   a fake capturing connection — no real database needed, but the SQL/params/`ON CONFLICT` clause
   are checked exactly.
+- **Postgres write retry**: `app._write_until_done()` keeps a point through a connection-level
+  failure (backoff, fresh connection each attempt) and drops a point the database rejects without
+  retrying it.
 - **P1 telegram ingestion**: framing and CRC verification across split reads and a corrupted
   telegram, OBIS parsing into electricity/gas readings, and a connection that stays open but stops
   delivering — `p1_reader_loop` must tear it down and rebuild it rather than waiting on it forever.

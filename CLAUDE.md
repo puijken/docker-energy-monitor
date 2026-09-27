@@ -32,7 +32,7 @@ docker run --rm -v "$PWD/smoke_test.py:/app/smoke_test.py:ro" energy-monitor:dev
 # or, with deps installed locally:
 python3 smoke_test.py
 
-# Run one check instead of all 15 (the full run takes ~10s; check_p1_stall_reconnect alone sleeps
+# Run one check instead of all of them (the full run takes ~10s; check_p1_stall_reconnect alone sleeps
 # several seconds against a real socket). Check functions take a `failures` list and append to it
 # rather than raising, so an empty list means it passed:
 docker run --rm -v "$PWD/smoke_test.py:/app/smoke_test.py:ro" energy-monitor:dev \
@@ -66,7 +66,12 @@ classes, just module-level globals guarded by `_state_lock` (or their own dedica
   `ENABLE_MQTT_PUBLISH`. Each sink is wrapped
   in its own `try/except` so a Postgres or MQTT outage can't stop the others.
 - **`pg_writer_loop`** — drains a `queue.Queue` fed by `queue_write()` and performs the actual
-  Postgres inserts, so DB latency never stretches the poll cadence.
+  Postgres inserts, so DB latency never stretches the poll cadence. Each point goes through
+  `_write_until_done`: a connection-level error (`psycopg.OperationalError`/`InterfaceError`)
+  keeps the point and retries on a fresh connection with 1s → 30s backoff, while the queue buffers
+  behind it; any other error means the point itself is bad and it is dropped, so it can't wedge
+  the writer. It used to dequeue-then-discard on any failure, so an outage lost everything polled
+  during it and the queue never filled.
 - **`mqtt_watchdog_loop`** — the paho-mqtt client runs its own network thread for the pub/sub
   connection; this loop separately reconnects on disconnect (`_on_mqtt_disconnect` sets a flag,
   this polls it) and resubscribes. Smart-meter data doesn't go through the broker at all. Both

@@ -26,6 +26,8 @@ surface at runtime. This file now additionally covers, all without a real broker
     against a fake capturing connection/cursor (no real database needed) -- catching both a
     psycopg API change and a regression in the write path itself (wrong table, wrong ON
     CONFLICT clause, a known column routed into `extra` or vice versa).
+  - Postgres write retry: app._write_until_done() keeps a point through a connection-level
+    failure (backoff, fresh connection) and drops one the database rejects, without retrying it.
   - psycopg + the Postgres read path: app.get_last_gas_reading() likewise, against a fake
     connection that returns a canned row.
   - Smart-plug MQTT message handling: app._on_mqtt_message() against real captured Zigbee2MQTT
@@ -620,6 +622,82 @@ def check_postgres_write(failures):
 
     if len(failures) == before:
         print("  postgres write: SQL/ON CONFLICT/params as expected, unmapped field routed into `extra`")
+
+
+class _FlakyConnection(_FakeConnection):
+    """A fake connection whose execute() raises `error` (once per connection) while the shared
+    `state["fail_left"]` counter is positive, then records normally."""
+
+    def __init__(self, state, error):
+        super().__init__()
+        self.closed = False
+
+        class _Cursor(_FakeCursor):
+            def execute(self, sql, params=None):
+                if state["fail_left"] > 0:
+                    state["fail_left"] -= 1
+                    raise error
+                state["written"].append((sql, params))
+
+        self.cursor_obj = _Cursor()
+
+    def close(self):
+        self.closed = True
+
+
+def check_postgres_write_retry(failures):
+    """_write_until_done(): a point survives a database outage instead of being thrown away, and
+    a point the database rejects is dropped instead of wedging the writer.
+
+    Runs the real retry loop with an injected sleep, against fake connections handed out by a
+    monkeypatched psycopg.connect(), so no real database and no real waiting are needed.
+    """
+    before = len(failures)
+    orig_conn, orig_connect = app._pg_conn, app.psycopg.connect
+    try:
+        # 1. Connection-level failure twice, then success: written once, backoff 1s then 2s, and a
+        #    fresh connection opened after each failure (the broken one closed).
+        state = {"fail_left": 2, "written": []}
+        opened = []
+
+        def _connect(**kwargs):
+            conn = _FlakyConnection(state, app.psycopg.OperationalError("server closed the connection"))
+            opened.append(conn)
+            return conn
+
+        app.psycopg.connect = _connect
+        app._pg_conn = None
+        sleeps = []
+        ok = app._write_until_done({"total_active_power": 1.0}, 1732900000000000000,
+                                   app.POSTGRES_TABLE, "sungrow_test", sleep=sleeps.append)
+        if ok is not True or len(state["written"]) != 1:
+            failures.append(f"  outage: expected the point written once after retries, got ok={ok!r}, "
+                            f"written={len(state['written'])}")
+        if sleeps != [1.0, 2.0]:
+            failures.append(f"  outage: expected backoff sleeps [1.0, 2.0], got {sleeps!r}")
+        if len(opened) != 3 or not all(c.closed for c in opened[:2]):
+            failures.append(f"  outage: expected 3 connections with the 2 failed ones closed, got "
+                            f"{len(opened)} opened, closed={[c.closed for c in opened]}")
+
+        # 2. The point itself is rejected: dropped at once, no retry, no sleep.
+        state = {"fail_left": 1, "written": []}
+        app.psycopg.connect = lambda **kwargs: _FlakyConnection(
+            state, app.psycopg.DataError("invalid input syntax"))
+        app._pg_conn = None
+        sleeps = []
+        ok = app._write_until_done({"total_active_power": "garbage"}, 1732900000000000000,
+                                   app.POSTGRES_TABLE, "sungrow_test", sleep=sleeps.append)
+        if ok is not False or sleeps:
+            failures.append(f"  rejected point: expected dropped without retry, got ok={ok!r}, sleeps={sleeps!r}")
+    except Exception as exc:
+        failures.append(f"  _write_until_done() raised {exc!r}")
+    finally:
+        app._pg_conn, app.psycopg.connect = orig_conn, orig_connect
+
+    if len(failures) == before:
+        print("  postgres write retry: point kept through a connection outage (1s/2s backoff, fresh "
+              "connection), rejected point dropped without retry")
+
 
 
 def check_get_last_gas_reading(failures):
@@ -1632,6 +1710,7 @@ def main():
     check_mqtt_connect(failures)
     check_mqtt_publish_switch(failures)
     check_postgres_write(failures)
+    check_postgres_write_retry(failures)
     check_get_last_gas_reading(failures)
     check_p1_telegram_parsing(failures)
     check_p1_relay_broadcast(failures)
@@ -1656,7 +1735,7 @@ def main():
         return 1
 
     print("smoke test passed: modbus, inverter reconnect after broken pipe, mqtt connect, mqtt publish switch, "
-          "postgres write, postgres read, P1 telegram parsing, "
+          "postgres write, postgres write retry, postgres read, P1 telegram parsing, "
           "P1 relay broadcast, P1 stall reconnect, plug parsing, DSMR timestamps (incl. DST fall-back), "
           "smart-meter source stability, pvoutput metrics, daily generation yield correction, "
           "derived fields, solar staleness fallback, "

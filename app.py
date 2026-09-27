@@ -539,9 +539,10 @@ _plug_seen = set()
 # thread rather than performed inline. A blocking write inside the MQTT callback in particular
 # stops the socket being drained and the broker discards messages for a slow consumer -- measured
 # as 6 of 20 lost with a synchronous write (against the old HTTP-based InfluxDB write path, but the
-# same physical constraint applies to any blocking write here). Bounded so a prolonged Postgres
-# outage cannot grow without limit; oldest points are dropped first, since fresh readings matter
-# more than stale ones.
+# same physical constraint applies to any blocking write here). During a Postgres outage the
+# writer holds its current point and retries (see _write_until_done), so this queue is what
+# buffers the outage. Bounded so a prolonged one cannot grow without limit; oldest points are
+# dropped first, since fresh readings matter more than stale ones.
 _write_queue = queue.Queue(maxsize=env_int("WRITE_QUEUE_SIZE", 2000))
 
 
@@ -1286,18 +1287,70 @@ def queue_write(values, ts_ns, table, source):
         log.warning("Postgres write queue still full after evicting; dropped the new point instead")
 
 
+PG_RETRY_MAX_BACKOFF = 30.0
+
+
+def _reset_pg_conn():
+    """Drops the writer's persistent connection so the next write opens a fresh one."""
+    global _pg_conn
+    try:
+        if _pg_conn is not None:
+            _pg_conn.close()
+    except Exception:
+        pass
+    _pg_conn = None
+
+
+def _write_until_done(values, ts_ns, table, source, sleep=time.sleep):
+    """Writes one point, retrying for as long as the database is unreachable.
+
+    Returns True once written, False if the point itself was rejected and dropped.
+
+    The writer used to take a point off the queue and discard it when the write failed, so a
+    database outage threw away everything polled during it while the queue -- sized precisely to
+    ride out an outage -- never filled. Now the failure type decides:
+      * psycopg.OperationalError / InterfaceError: the connection is the problem (server down,
+        restarting, unreachable, admin shutdown, deadlock). The point is kept and retried with a
+        1s -> PG_RETRY_MAX_BACKOFF backoff on a fresh connection. New points pile up behind it in
+        _write_queue, whose drop-oldest policy is what bounds a really long outage.
+      * anything else (DataError, ProgrammingError, e.g. a column the table doesn't have): the
+        point is the problem and no retry can fix it. It is dropped so it can't wedge the writer
+        and every point queued behind it.
+    `sleep` is injectable so the smoke test can run the retry path without waiting.
+    """
+    backoff = 1.0
+    failed_since = None
+    while True:
+        try:
+            write_postgres(values, ts_ns, table=table, source=source)
+            if failed_since is not None:
+                log.info("Postgres reachable again after %.0fs; %d point(s) queued behind this one",
+                         time.monotonic() - failed_since, _write_queue.qsize())
+            return True
+        except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+            if failed_since is None:
+                failed_since = time.monotonic()
+                log.warning("Postgres unreachable (%s); holding the point and retrying", exc)
+            else:
+                log.debug("Postgres still unreachable (%s); retrying in %.0fs", exc, backoff)
+            _reset_pg_conn()
+            sleep(backoff)
+            backoff = min(backoff * 2, PG_RETRY_MAX_BACKOFF)
+        except Exception:
+            log.exception("Postgres rejected a point for %s; dropping it", table)
+            return False
+
+
 def pg_writer_loop():
     """Drains _write_queue.
 
     Every Postgres write goes through here so no producer ever blocks on it. A write is a network
     round trip, which would otherwise stretch the poll interval and stall paho's network thread.
+    Retry-versus-drop is decided per point in _write_until_done().
     """
     while True:
         values, ts_ns, table, source = _write_queue.get()
-        try:
-            write_postgres(values, ts_ns, table=table, source=source)
-        except Exception:
-            log.exception("Postgres write failed for %s", table)
+        _write_until_done(values, ts_ns, table, source)
 
 
 def pvoutput_loop():

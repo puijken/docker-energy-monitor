@@ -10,7 +10,7 @@ consumes Zigbee2MQTT for per-circuit smart-plug submetering; writes everything t
 optionally republishes inverter and smart-meter readings to MQTT (gated by `ENABLE_MQTT_PUBLISH`,
 default off), and optionally uploads to PVOutput and Mindergas. Built as a self-maintained
 replacement for the third-party `bohdans/sungather` image. Published to
-`ghcr.io/puijken/energy-monitor`.
+`ghcr.io/puijken/docker-energy-monitor`.
 
 **This repo is public.** Real device names, IPs, and deployment status belong in a gitignored
 `*.local.md` file (see `DEPLOYMENT.local.md`), never in README.md, code comments, or committed

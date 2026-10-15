@@ -1,6 +1,6 @@
 services:
   energy-monitor:
-    image: ghcr.io/puijken/energy-monitor:latest
+    image: ghcr.io/puijken/docker-energy-monitor:latest
     environment:
       - TZ=Europe/Amsterdam
       # Inverter / dongle address on your network

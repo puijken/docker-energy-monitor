@@ -104,7 +104,8 @@ classes, just module-level globals guarded by `_state_lock` (or their own dedica
 - **`mindergas_loop`** — fires once daily at `MINDERGAS_HOUR:MINDERGAS_MINUTE`, retrying within
   that same hour on failure.
 - **`monta_loop`** (when `ENABLE_MONTA=true`) — runs `sync_monta()` at startup, then daily at
-  `MONTA_HOUR:MONTA_MINUTE`, retrying every `MONTA_RETRY_INTERVAL` until it succeeds. The API
+  each of `MONTA_TIMES` (`latest_monta_slot` decides what's due), retrying every
+  `MONTA_RETRY_INTERVAL` until it succeeds. The API
   client is the separate, standard-library-only **`stroohm_monta.py`**, kept free of anything from
   `app.py` so it can be copied out and used on its own (README "Stroohm / Monta charging
   sessions"). Keep it that way: no imports from `app`, no third-party packages.

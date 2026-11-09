@@ -113,7 +113,7 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `MINDERGAS_GAS_FIELD` | `delivered` | Column name within that table |
 | `ENABLE_MONTA` | `false` | Fetch your EV charging sessions daily from Monta's Public API into `MONTA_TABLE`. See [Stroohm / Monta charging sessions](#stroohm--monta-charging-sessions) |
 | `MONTA_CLIENT_ID` / `MONTA_CLIENT_SECRET` | *required with `ENABLE_MONTA`* | A Monta Hub application's credentials (Profile → Applications) |
-| `MONTA_HOUR` / `MONTA_MINUTE` | `6` / `15` | Local time-of-day of the daily fetch (it also runs once at startup) |
+| `MONTA_TIMES` | `04:00,21:00` | Local times of day to fetch, comma-separated (it also runs once at startup) |
 | `MONTA_LOOKBACK_DAYS` | `0` | Only re-fetch sessions created in the last N days; `0` re-fetches everything every run |
 | `MONTA_TABLE` | `monta_charges` | Table the sessions are upserted into (on `id`) |
 | `MONTA_VAT_RATE` | `0.21` | VAT included in Monta's `price`, used for `price_excl_vat` |
@@ -441,9 +441,10 @@ What a session tells you, and what it doesn't:
 - The rate limit is 10 requests a minute, shared by all of a user's applications; the client paces
   itself and waits out a 429.
 
-With `ENABLE_MONTA=true` this container runs it at startup and then daily at
-`MONTA_HOUR:MONTA_MINUTE`, upserting every completed session into `MONTA_TABLE` in one
-transaction. Re-fetching the whole history each time is deliberate: it is a handful of requests,
+With `ENABLE_MONTA=true` this container runs it at startup and then every day at each of
+`MONTA_TIMES` (default 04:00 and 21:00: the evening run shows an early-evening session the same
+night, the morning one catches later ones), upserting every completed session into `MONTA_TABLE`
+in one transaction. Re-fetching the whole history each time is deliberate: it is a handful of requests,
 and a session Monta corrects afterwards is corrected here too. The table must exist first:
 
 ```sql

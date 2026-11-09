@@ -1799,8 +1799,30 @@ def check_monta(failures):
         app.psycopg.connect = orig_connect
         server.shutdown()
 
+    # Schedule: MONTA_TIMES parsing and which slot is due.
+    try:
+        if app.parse_monta_times("21:00, 04:00,21:00") != [(4, 0), (21, 0)]:
+            failures.append("  parse_monta_times: '21:00, 04:00,21:00' should give [(4, 0), (21, 0)]")
+        for bad in ("", "4", "25:00", "04:60", "04:00,x"):
+            if app.parse_monta_times(bad) is not None:
+                failures.append(f"  parse_monta_times({bad!r}) should be None")
+        times = [(4, 0), (21, 0)]
+        cases = [
+            (datetime(2026, 11, 9, 3, 59), datetime(2026, 11, 8, 21, 0)),   # before 04:00 -> yesterday 21:00
+            (datetime(2026, 11, 9, 4, 0), datetime(2026, 11, 9, 4, 0)),
+            (datetime(2026, 11, 9, 20, 59), datetime(2026, 11, 9, 4, 0)),
+            (datetime(2026, 11, 9, 23, 0), datetime(2026, 11, 9, 21, 0)),
+        ]
+        for now, want in cases:
+            got = app.latest_monta_slot(now, times)
+            if got != want:
+                failures.append(f"  latest_monta_slot({now}): expected {want}, got {got}")
+    except Exception as e:
+        failures.append(f"  monta schedule: {type(e).__name__}: {e}")
+
     if len(failures) == before:
-        print("  monta: token + paging + 429 retry, session flattening (excl. VAT, UTC times), sync upsert")
+        print("  monta: token + paging + 429 retry, session flattening (excl. VAT, UTC times), sync upsert, "
+              "MONTA_TIMES parsing and due-slot logic")
 
 
 def _timeout_handler(signum, frame):

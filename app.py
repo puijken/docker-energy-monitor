@@ -321,8 +321,28 @@ MINDERGAS_GAS_FIELD = env("MINDERGAS_GAS_FIELD", "delivered")
 ENABLE_MONTA = env_bool("ENABLE_MONTA", False)
 MONTA_CLIENT_ID = env("MONTA_CLIENT_ID")
 MONTA_CLIENT_SECRET = env("MONTA_CLIENT_SECRET")
-MONTA_HOUR = env_int("MONTA_HOUR", 6)
-MONTA_MINUTE = env_int("MONTA_MINUTE", 15)
+
+
+def parse_monta_times(raw):
+    """'21:00,04:00' -> [(4, 0), (21, 0)] (sorted, deduplicated), or None if anything is malformed."""
+    try:
+        times = set()
+        for part in (raw or "").split(","):
+            hh, mm = part.strip().split(":")
+            h, m = int(hh), int(mm)
+            if not (0 <= h < 24 and 0 <= m < 60):
+                return None
+            times.add((h, m))
+        return sorted(times) or None
+    except ValueError:
+        return None
+
+
+# Local times of day to fetch, comma-separated. Twice a day by default: an evening run so a
+# session that ended in the early evening is on the dashboards the same night, and an early
+# morning one for anything that finished later.
+MONTA_TIMES_RAW = env("MONTA_TIMES", "04:00,21:00")
+MONTA_TIMES = parse_monta_times(MONTA_TIMES_RAW)
 MONTA_RETRY_INTERVAL = env_int("MONTA_RETRY_INTERVAL", 900)
 MONTA_LOOKBACK_DAYS = env_int("MONTA_LOOKBACK_DAYS", 0)   # 0 = everything, every run
 MONTA_TABLE = env("MONTA_TABLE", "monta_charges")
@@ -1401,28 +1421,35 @@ def sync_monta(client=None):
     return len(rows)
 
 
-def monta_loop():
-    """Runs sync_monta() once at startup, then daily once the clock reaches MONTA_HOUR:MONTA_MINUTE.
+def latest_monta_slot(now, times):
+    """The most recent scheduled run time at or before `now` (naive local), from today's or
+    yesterday's MONTA_TIMES -- never None, since yesterday's are always in the past."""
+    return max(
+        datetime.combine(day, datetime.min.time()).replace(hour=h, minute=m)
+        for day in (now.date(), now.date() - timedelta(days=1))
+        for h, m in times
+        if datetime.combine(day, datetime.min.time()).replace(hour=h, minute=m) <= now
+    )
 
-    Unlike Mindergas, an extra run (on a restart, say) is harmless -- it's an idempotent upsert of
-    the same sessions -- so it also runs straight away, which makes a first deploy or a config fix
-    take effect without waiting for the next day. A failure retries every MONTA_RETRY_INTERVAL
-    until it succeeds, rather than only within the target hour: a missed day would otherwise just
-    be a day's delay, but there's no reason to accept even that.
+
+def monta_loop():
+    """Runs sync_monta() once at startup, then at each of MONTA_TIMES (local) every day.
+
+    A run is due when the latest scheduled slot hasn't been served yet -- polling the wall clock
+    each minute, like mindergas_loop, so a restart, clock jump or DST change can't skip a slot or
+    run one twice. Unlike Mindergas, an extra run is harmless (an idempotent upsert of the same
+    sessions), so it also runs straight away at startup, which makes a first deploy or a config
+    fix take effect immediately; that startup run counts as the slot just passed, so it isn't
+    repeated. A failure retries every MONTA_RETRY_INTERVAL until it succeeds.
     """
-    completed_for = None
-    first = True
+    served = None
     while True:
         now = datetime.now()
-        due = first or (completed_for != now.date()
-                        and (now.hour, now.minute) >= (MONTA_HOUR, MONTA_MINUTE))
-        if due:
+        slot = latest_monta_slot(now, MONTA_TIMES)
+        if slot != served:
             try:
                 sync_monta()
-                # A startup run before the target time doesn't count as that day's run.
-                if (now.hour, now.minute) >= (MONTA_HOUR, MONTA_MINUTE):
-                    completed_for = now.date()
-                first = False
+                served = slot
             except Exception:
                 log.exception("Monta sync failed; retrying in %ss", MONTA_RETRY_INTERVAL)
                 time.sleep(MONTA_RETRY_INTERVAL)
@@ -1752,6 +1779,9 @@ def validate_config():
 
     if ENABLE_MONTA and not (MONTA_CLIENT_ID and MONTA_CLIENT_SECRET):
         log.error("ENABLE_MONTA is set but MONTA_CLIENT_ID and/or MONTA_CLIENT_SECRET is missing")
+        sys.exit(1)
+    if ENABLE_MONTA and MONTA_TIMES is None:
+        log.error("MONTA_TIMES=%r is not a comma-separated list of HH:MM times", MONTA_TIMES_RAW)
         sys.exit(1)
 
     if ENABLE_P1 and not P1_HOST:

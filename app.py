@@ -15,6 +15,8 @@ import psycopg
 import requests
 from pymodbus.client import ModbusTcpClient
 
+import stroohm_monta
+
 LOG_LEVELS = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING,
               "ERROR": logging.ERROR, "CRITICAL": logging.CRITICAL}
 
@@ -309,6 +311,24 @@ MINDERGAS_RETRY_INTERVAL = env_int("MINDERGAS_RETRY_INTERVAL", 900)
 # which needs timestamped history, not the current value.
 MINDERGAS_GAS_TABLE = env("MINDERGAS_GAS_TABLE", GAS_TABLE)
 MINDERGAS_GAS_FIELD = env("MINDERGAS_GAS_FIELD", "delivered")
+
+# Monta (EV charge card) sessions, fetched daily from Monta's Public API by stroohm_monta.py and upserted
+# into MONTA_TABLE. Not energy *measured* here -- it's charging done elsewhere, on public and work
+# chargers -- but the same daily-integration shape as Mindergas, and it lands in the same database
+# as the home charging it's compared against. Every run re-fetches the whole history (or the last
+# MONTA_LOOKBACK_DAYS), so a session corrected after the fact is corrected here too; the upsert on
+# Monta's session id makes that idempotent. See README "Monta charging sessions".
+ENABLE_MONTA = env_bool("ENABLE_MONTA", False)
+MONTA_CLIENT_ID = env("MONTA_CLIENT_ID")
+MONTA_CLIENT_SECRET = env("MONTA_CLIENT_SECRET")
+MONTA_HOUR = env_int("MONTA_HOUR", 6)
+MONTA_MINUTE = env_int("MONTA_MINUTE", 15)
+MONTA_RETRY_INTERVAL = env_int("MONTA_RETRY_INTERVAL", 900)
+MONTA_LOOKBACK_DAYS = env_int("MONTA_LOOKBACK_DAYS", 0)   # 0 = everything, every run
+MONTA_TABLE = env("MONTA_TABLE", "monta_charges")
+MONTA_VAT_RATE = float(env("MONTA_VAT_RATE", str(stroohm_monta.DEFAULT_VAT_RATE)))
+MONTA_COLUMNS = ["id", "human_readable_id", "state", "charge_point_id", "started_at", "stopped_at",
+                 "energy_kwh", "price_incl_vat", "price_excl_vat", "currency", "raw"]
 
 # Modbus register map for the Sungrow SG5.0RS (device_type_code 0x2606, nominal 5.0 kW) -- a
 # single-phase residential string inverter with no battery or meter, so the hybrid-only
@@ -1353,6 +1373,63 @@ def pg_writer_loop():
         _write_until_done(values, ts_ns, table, source)
 
 
+def sync_monta(client=None):
+    """Fetch completed Monta sessions and upsert them into MONTA_TABLE in one transaction.
+    Returns the number of sessions written. `client` is injectable for the smoke test."""
+    client = client or stroohm_monta.Monta(MONTA_CLIENT_ID, MONTA_CLIENT_SECRET)
+    since = (datetime.now(timezone.utc) - timedelta(days=MONTA_LOOKBACK_DAYS)
+             if MONTA_LOOKBACK_DAYS > 0 else None)
+    rows = []
+    for s in client.sessions(vat_rate=MONTA_VAT_RATE, from_date=since):
+        if s["started_at"] is None or s["energy_kwh"] is None:
+            log.warning("Skipping Monta session %s without a start time or energy", s["id"])
+            continue
+        rows.append([json.dumps(s["raw"]) if c == "raw" else s[c] for c in MONTA_COLUMNS])
+
+    updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in MONTA_COLUMNS[1:])
+    sql = (f"INSERT INTO {MONTA_TABLE} ({', '.join(MONTA_COLUMNS)}, fetched_at) "
+           f"VALUES ({', '.join(['%s'] * len(MONTA_COLUMNS))}, now()) "
+           f"ON CONFLICT (id) DO UPDATE SET {updates}, fetched_at = now()")
+    with psycopg.connect(
+        host=POSTGRES_HOST, port=POSTGRES_PORT, dbname=POSTGRES_DB,
+        user=POSTGRES_USER, password=POSTGRES_PASSWORD,
+    ) as conn:
+        with conn.cursor() as cur:
+            for row in rows:
+                cur.execute(sql, row)
+    log.info("Monta: upserted %d session(s) into %s", len(rows), MONTA_TABLE)
+    return len(rows)
+
+
+def monta_loop():
+    """Runs sync_monta() once at startup, then daily once the clock reaches MONTA_HOUR:MONTA_MINUTE.
+
+    Unlike Mindergas, an extra run (on a restart, say) is harmless -- it's an idempotent upsert of
+    the same sessions -- so it also runs straight away, which makes a first deploy or a config fix
+    take effect without waiting for the next day. A failure retries every MONTA_RETRY_INTERVAL
+    until it succeeds, rather than only within the target hour: a missed day would otherwise just
+    be a day's delay, but there's no reason to accept even that.
+    """
+    completed_for = None
+    first = True
+    while True:
+        now = datetime.now()
+        due = first or (completed_for != now.date()
+                        and (now.hour, now.minute) >= (MONTA_HOUR, MONTA_MINUTE))
+        if due:
+            try:
+                sync_monta()
+                # A startup run before the target time doesn't count as that day's run.
+                if (now.hour, now.minute) >= (MONTA_HOUR, MONTA_MINUTE):
+                    completed_for = now.date()
+                first = False
+            except Exception:
+                log.exception("Monta sync failed; retrying in %ss", MONTA_RETRY_INTERVAL)
+                time.sleep(MONTA_RETRY_INTERVAL)
+                continue
+        time.sleep(60)
+
+
 def pvoutput_loop():
     """Fires on PVOUTPUT_INTERVAL-aligned wall-clock boundaries (:00/:05/:10 for the 300s
     default), not on a timer counted from container start -- otherwise every restart shifts the
@@ -1673,6 +1750,10 @@ def validate_config():
         log.error("ENABLE_MINDERGAS is set but ENABLE_P1 is false -- there's no other gas source")
         sys.exit(1)
 
+    if ENABLE_MONTA and not (MONTA_CLIENT_ID and MONTA_CLIENT_SECRET):
+        log.error("ENABLE_MONTA is set but MONTA_CLIENT_ID and/or MONTA_CLIENT_SECRET is missing")
+        sys.exit(1)
+
     if ENABLE_P1 and not P1_HOST:
         log.error("ENABLE_P1 is set but P1_HOST is missing")
         sys.exit(1)
@@ -1697,7 +1778,7 @@ def validate_config():
 def main():
     log.info(
         "Starting energy-monitor: inverter=%s:%s scan_interval=%ss p1=%s(%s:%s) p1_relay=%s(%s:%s) "
-        "mqtt_publish=%s(%s,%s) plugs=%s(%d) pvoutput=%s mindergas=%s",
+        "mqtt_publish=%s(%s,%s) plugs=%s(%d) pvoutput=%s mindergas=%s monta=%s",
         INVERTER_HOST,
         INVERTER_PORT,
         SCAN_INTERVAL,
@@ -1714,6 +1795,7 @@ def main():
         len(PLUG_TOPIC_MAP),
         ENABLE_PVOUTPUT,
         ENABLE_MINDERGAS,
+        ENABLE_MONTA,
     )
     validate_config()
 
@@ -1730,6 +1812,8 @@ def main():
     threading.Thread(target=pg_writer_loop, daemon=True).start()
     threading.Thread(target=pvoutput_loop, daemon=True).start()
     threading.Thread(target=mindergas_loop, daemon=True).start()
+    if ENABLE_MONTA:
+        threading.Thread(target=monta_loop, daemon=True).start()
     if ENABLE_P1:
         threading.Thread(target=p1_reader_loop, daemon=True).start()
     if ENABLE_P1_RELAY:

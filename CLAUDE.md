@@ -105,10 +105,9 @@ classes, just module-level globals guarded by `_state_lock` (or their own dedica
   that same hour on failure.
 - **`monta_loop`** (when `ENABLE_MONTA=true`) — runs `sync_monta()` at startup, then daily at
   each of `MONTA_TIMES` (`latest_monta_slot` decides what's due), retrying every
-  `MONTA_RETRY_INTERVAL` until it succeeds. The API
-  client is the separate, standard-library-only **`stroohm_monta.py`**, kept free of anything from
-  `app.py` so it can be copied out and used on its own (README "Stroohm / Monta charging
-  sessions"). Keep it that way: no imports from `app`, no third-party packages.
+  `MONTA_RETRY_INTERVAL` until it succeeds. The API client, `stroohm_monta_api.py`, is not in
+  this repo: the Dockerfile downloads it from github.com/puijken/stroohm-monta-api at a pinned
+  commit (`STROOHM_MONTA_API_REF`). Change it there, then bump the ref here.
 
 `_handle_p1_telegram` runs on `p1_reader_loop`'s own thread, which is the *other* trigger for
 `power_flow` writes (see README's "Why power_flow updates from two triggers") — so `_state_lock`

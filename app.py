@@ -15,7 +15,7 @@ import psycopg
 import requests
 from pymodbus.client import ModbusTcpClient
 
-import stroohm_monta
+import stroohm_monta_api
 
 LOG_LEVELS = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING,
               "ERROR": logging.ERROR, "CRITICAL": logging.CRITICAL}
@@ -312,7 +312,8 @@ MINDERGAS_RETRY_INTERVAL = env_int("MINDERGAS_RETRY_INTERVAL", 900)
 MINDERGAS_GAS_TABLE = env("MINDERGAS_GAS_TABLE", GAS_TABLE)
 MINDERGAS_GAS_FIELD = env("MINDERGAS_GAS_FIELD", "delivered")
 
-# Monta (EV charge card) sessions, fetched daily from Monta's Public API by stroohm_monta.py and upserted
+# Monta (EV charge card) sessions, fetched from Monta's Public API by stroohm_monta_api.py
+# (github.com/puijken/stroohm-monta-api, added at image build) and upserted
 # into MONTA_TABLE. Not energy *measured* here -- it's charging done elsewhere, on public and work
 # chargers -- but the same daily-integration shape as Mindergas, and it lands in the same database
 # as the home charging it's compared against. Every run re-fetches the whole history (or the last
@@ -346,7 +347,7 @@ MONTA_TIMES = parse_monta_times(MONTA_TIMES_RAW)
 MONTA_RETRY_INTERVAL = env_int("MONTA_RETRY_INTERVAL", 900)
 MONTA_LOOKBACK_DAYS = env_int("MONTA_LOOKBACK_DAYS", 0)   # 0 = everything, every run
 MONTA_TABLE = env("MONTA_TABLE", "monta_charges")
-MONTA_VAT_RATE = float(env("MONTA_VAT_RATE", str(stroohm_monta.DEFAULT_VAT_RATE)))
+MONTA_VAT_RATE = float(env("MONTA_VAT_RATE", str(stroohm_monta_api.DEFAULT_VAT_RATE)))
 MONTA_COLUMNS = ["id", "human_readable_id", "state", "charge_point_id", "started_at", "stopped_at",
                  "energy_kwh", "price_incl_vat", "price_excl_vat", "currency", "raw"]
 
@@ -1396,7 +1397,7 @@ def pg_writer_loop():
 def sync_monta(client=None):
     """Fetch completed Monta sessions and upsert them into MONTA_TABLE in one transaction.
     Returns the number of sessions written. `client` is injectable for the smoke test."""
-    client = client or stroohm_monta.Monta(MONTA_CLIENT_ID, MONTA_CLIENT_SECRET)
+    client = client or stroohm_monta_api.Monta(MONTA_CLIENT_ID, MONTA_CLIENT_SECRET)
     since = (datetime.now(timezone.utc) - timedelta(days=MONTA_LOOKBACK_DAYS)
              if MONTA_LOOKBACK_DAYS > 0 else None)
     rows = []

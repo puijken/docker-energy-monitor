@@ -35,8 +35,7 @@ for the third-party `bohdans/sungather` image.
   midnight (gated by `ENABLE_MINDERGAS`, default off), reading the value back out of the
   `gas_positions` table this container itself writes.
 - Optionally fetches your EV charging sessions daily from Monta's Public API (a Stroohm charge
-  card, or any Monta account) into a table of their own (`ENABLE_MONTA`, default off). The fetcher,
-  `stroohm_monta.py`, also works standalone. See
+  card, or any Monta account) into a table of their own (`ENABLE_MONTA`, default off). See
   [Stroohm / Monta charging sessions](#stroohm--monta-charging-sessions).
 
 All three outbound integrations (`ENABLE_MQTT_PUBLISH`, `ENABLE_PVOUTPUT`, `ENABLE_MINDERGAS`)
@@ -412,40 +411,19 @@ full list of valid names and exits rather than uploading something unintended.
 
 ## Stroohm / Monta charging sessions
 
-[`stroohm_monta.py`](stroohm_monta.py) fetches your own charging sessions from
-[Monta's Public API](https://docs.public-api.monta.com/). It was written for a Stroohm charge card,
-which runs on Monta, but works for any Monta account. It is standalone and uses only the Python
-standard library, so it can be copied out of this repo and used on its own:
+With `ENABLE_MONTA=true` this container fetches your EV charging sessions from Monta's Public API
+(a Stroohm charge card runs on Monta) at startup and then every day at each of `MONTA_TIMES`
+(default 04:00 and 21:00: the evening run shows an early-evening session the same night, the
+morning one catches later ones). Every completed session is upserted into `MONTA_TABLE` on Monta's
+session id, in one transaction, so re-fetching the whole history each run is harmless and picks up
+sessions Monta corrects afterwards.
 
-```bash
-export MONTA_CLIENT_ID=... MONTA_CLIENT_SECRET=...
-python3 stroohm_monta.py                         # all completed sessions, JSON
-python3 stroohm_monta.py --format csv > sessions.csv
-python3 stroohm_monta.py --from 2026-11-01       # created on/after (UTC)
-```
+The API client is [stroohm-monta-api](https://github.com/puijken/stroohm-monta-api), which the
+image build downloads at a pinned commit (`STROOHM_MONTA_API_REF` in the Dockerfile). Its README
+covers creating the credentials (Monta Hub → Profile → Applications) and what the fields mean,
+e.g. that `price_incl_vat` is what you paid and that sessions carry a charger ID but no address.
 
-or `import stroohm_monta` and iterate `stroohm_monta.Monta(id, secret).sessions()`. Create the
-credentials in Monta Hub under **Profile → Applications** (the secret is shown once). They belong
-to the *Public* API (`public-api.monta.com`); Monta's Partner API is for charge point operators
-and rejects them.
-
-What a session tells you, and what it doesn't:
-- **`price` is what you paid, incl. VAT.** Checked against a receipt: `price` 6.17 = the
-  receipt's 5.10 excl. VAT × 1.21. `price_excl_vat` divides by `--vat`/`MONTA_VAT_RATE` (0.21 for
-  BE and NL). Monta's `cost` field is something else (lower than the receipt) and is only kept in
-  the raw object.
-- **No location.** A session has a numeric `chargePointId` only, and Monta answers lookups only
-  for charge points you own (403 otherwise). Naming chargers is left to the consumer, e.g. a small
-  id → address table on the database side.
-- Times are UTC. Only `completed` sessions are returned unless asked otherwise.
-- The rate limit is 10 requests a minute, shared by all of a user's applications; the client paces
-  itself and waits out a 429.
-
-With `ENABLE_MONTA=true` this container runs it at startup and then every day at each of
-`MONTA_TIMES` (default 04:00 and 21:00: the evening run shows an early-evening session the same
-night, the morning one catches later ones), upserting every completed session into `MONTA_TABLE`
-in one transaction. Re-fetching the whole history each time is deliberate: it is a handful of requests,
-and a session Monta corrects afterwards is corrected here too. The table must exist first:
+The table must exist first:
 
 ```sql
 CREATE TABLE monta_charges (

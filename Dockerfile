@@ -8,7 +8,12 @@ COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 RUN useradd --create-home --uid 1000 monitor
-COPY --chown=monitor:monitor app.py stroohm_monta.py /app/
+COPY --chown=monitor:monitor app.py /app/
+# The Monta API client (ENABLE_MONTA) lives in its own repo, github.com/puijken/stroohm-monta-api.
+# Pinned to a commit so a rebuild can't pick up an untested change; bump the ref to update it.
+ARG STROOHM_MONTA_API_REF=595d8c13bb3715841374e9077254c8fdb10fec10
+ADD --chown=monitor:monitor --chmod=644 \
+    https://raw.githubusercontent.com/puijken/stroohm-monta-api/${STROOHM_MONTA_API_REF}/stroohm_monta_api.py /app/
 USER monitor
 
 ENV PYTHONUNBUFFERED=1 \

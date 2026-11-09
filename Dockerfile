@@ -8,7 +8,7 @@ COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 RUN useradd --create-home --uid 1000 monitor
-COPY --chown=monitor:monitor app.py /app/
+COPY --chown=monitor:monitor app.py stroohm_monta.py /app/
 USER monitor
 
 ENV PYTHONUNBUFFERED=1 \

@@ -34,6 +34,10 @@ for the third-party `bohdans/sungather` image.
 - Optionally pushes the previous day's cumulative gas meter reading to Mindergas shortly after
   midnight (gated by `ENABLE_MINDERGAS`, default off), reading the value back out of the
   `gas_positions` table this container itself writes.
+- Optionally fetches your EV charging sessions daily from Monta's Public API (a Stroohm charge
+  card, or any Monta account) into a table of their own (`ENABLE_MONTA`, default off). The fetcher,
+  `stroohm_monta.py`, also works standalone. See
+  [Stroohm / Monta charging sessions](#stroohm--monta-charging-sessions).
 
 All three outbound integrations (`ENABLE_MQTT_PUBLISH`, `ENABLE_PVOUTPUT`, `ENABLE_MINDERGAS`)
 default to `false`, so nothing leaves this container unless you opt in and it can run safely
@@ -107,6 +111,13 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `MINDERGAS_RETRY_INTERVAL` | `900` | Seconds to wait before retrying a failed daily push (retries stay within `MINDERGAS_HOUR`) |
 | `MINDERGAS_GAS_TABLE` | `gas_positions` | Table this container's own P1 ingestion writes gas readings to |
 | `MINDERGAS_GAS_FIELD` | `delivered` | Column name within that table |
+| `ENABLE_MONTA` | `false` | Fetch your EV charging sessions daily from Monta's Public API into `MONTA_TABLE`. See [Stroohm / Monta charging sessions](#stroohm--monta-charging-sessions) |
+| `MONTA_CLIENT_ID` / `MONTA_CLIENT_SECRET` | *required with `ENABLE_MONTA`* | A Monta Hub application's credentials (Profile → Applications) |
+| `MONTA_HOUR` / `MONTA_MINUTE` | `6` / `15` | Local time-of-day of the daily fetch (it also runs once at startup) |
+| `MONTA_LOOKBACK_DAYS` | `0` | Only re-fetch sessions created in the last N days; `0` re-fetches everything every run |
+| `MONTA_TABLE` | `monta_charges` | Table the sessions are upserted into (on `id`) |
+| `MONTA_VAT_RATE` | `0.21` | VAT included in Monta's `price`, used for `price_excl_vat` |
+| `MONTA_RETRY_INTERVAL` | `900` | Seconds between retries after a failed fetch |
 | `TZ` | *(container default)* | Timezone for scheduling/logging |
 
 ## Log levels
@@ -398,6 +409,51 @@ counters — `1` = both lifetime, `2` = only `v1`, `3` = only `v3`, omitted = bo
 mismatch makes PVOutput derive the wrong energy figures, so the container checks the combination at
 startup and logs a warning describing the fix. An unknown metric name is a hard error: it logs the
 full list of valid names and exits rather than uploading something unintended.
+
+## Stroohm / Monta charging sessions
+
+[`stroohm_monta.py`](stroohm_monta.py) fetches your own charging sessions from
+[Monta's Public API](https://docs.public-api.monta.com/). It was written for a Stroohm charge card,
+which runs on Monta, but works for any Monta account. It is standalone and uses only the Python
+standard library, so it can be copied out of this repo and used on its own:
+
+```bash
+export MONTA_CLIENT_ID=... MONTA_CLIENT_SECRET=...
+python3 stroohm_monta.py                         # all completed sessions, JSON
+python3 stroohm_monta.py --format csv > sessions.csv
+python3 stroohm_monta.py --from 2026-11-01       # created on/after (UTC)
+```
+
+or `import stroohm_monta` and iterate `stroohm_monta.Monta(id, secret).sessions()`. Create the
+credentials in Monta Hub under **Profile → Applications** (the secret is shown once). They belong
+to the *Public* API (`public-api.monta.com`); Monta's Partner API is for charge point operators
+and rejects them.
+
+What a session tells you, and what it doesn't:
+- **`price` is what you paid, incl. VAT.** Checked against a receipt: `price` 6.17 = the
+  receipt's 5.10 excl. VAT × 1.21. `price_excl_vat` divides by `--vat`/`MONTA_VAT_RATE` (0.21 for
+  BE and NL). Monta's `cost` field is something else (lower than the receipt) and is only kept in
+  the raw object.
+- **No location.** A session has a numeric `chargePointId` only, and Monta answers lookups only
+  for charge points you own (403 otherwise). Naming chargers is left to the consumer, e.g. a small
+  id → address table on the database side.
+- Times are UTC. Only `completed` sessions are returned unless asked otherwise.
+- The rate limit is 10 requests a minute, shared by all of a user's applications; the client paces
+  itself and waits out a 429.
+
+With `ENABLE_MONTA=true` this container runs it at startup and then daily at
+`MONTA_HOUR:MONTA_MINUTE`, upserting every completed session into `MONTA_TABLE` in one
+transaction. Re-fetching the whole history each time is deliberate: it is a handful of requests,
+and a session Monta corrects afterwards is corrected here too. The table must exist first:
+
+```sql
+CREATE TABLE monta_charges (
+    id bigint PRIMARY KEY, human_readable_id text, state text, charge_point_id bigint,
+    started_at timestamptz NOT NULL, stopped_at timestamptz, energy_kwh double precision NOT NULL,
+    price_incl_vat double precision, price_excl_vat double precision, currency text,
+    raw jsonb, fetched_at timestamptz NOT NULL DEFAULT now()
+);
+```
 
 ## Mindergas integration
 

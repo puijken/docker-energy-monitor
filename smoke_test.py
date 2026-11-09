@@ -62,6 +62,9 @@ surface at runtime. This file now additionally covers, all without a real broker
     without touching Postgres, a cache miss queries and caches app.get_daily_yield_baseline(), and
     both a missing baseline row and PVOUTPUT_USE_RAW_DAILY_YIELD=True fall back to the raw
     register.
+  - Stroohm/Monta: stroohm_monta.py against an in-process fake of Monta's Public API (paging, a 429,
+    session flattening incl. the excl.-VAT price), then app.sync_monta()'s upsert against a fake
+    Postgres connection.
 
 Run with no arguments; exits non-zero on the first failed expectation. Guarded by an overall
 wall-clock timeout so a hang in any check (e.g. a client that doesn't disconnect cleanly) fails
@@ -1695,6 +1698,111 @@ def check_daily_generation_wh_corrected(failures):
         )
 
 
+def _monta_charge(i, **over):
+    c = {"id": 900000000000000000 + i, "humanReadableId": f"TEST-{i}", "chargePointId": 4242,
+         "createdAt": "2026-11-07T14:14:58Z", "updatedAt": "2026-11-07T15:27:15Z",
+         "cablePluggedInAt": "2026-11-07T14:15:10Z", "startedAt": "2026-11-07T14:15:03Z",
+         "stoppedAt": "2026-11-07T15:22:30.99Z", "state": "completed", "consumedKwh": 11.85,
+         "price": 6.17, "cost": 3.53, "currency": {"identifier": "eur", "name": "Euros", "decimals": 2}}
+    c.update(over)
+    return c
+
+
+def check_monta(failures):
+    """stroohm_monta.py against an in-process fake of Monta's Public API (token, two pages of charges, one
+    429 on the way), then app.sync_monta() against a fake Postgres connection. Covers: paging until
+    totalPageCount, waiting out a 429 instead of failing, the Bearer token being sent, the session
+    flattening (price excl. VAT = price / 1.21 matched a real receipt: 6.17 -> 5.10; start/stop
+    times as aware UTC datetimes), and the upsert's shape (ON CONFLICT (id), raw JSON kept)."""
+    import http.server
+    import stroohm_monta as monta
+
+    before = len(failures)
+    seen = {"auth": [], "paths": [], "throttled": False}
+    pages = [[_monta_charge(1), _monta_charge(2)], [_monta_charge(3, price=None, consumedKwh=0)]]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body):
+            data = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if body != {"clientId": "id", "clientSecret": "secret"}:
+                return self._send(401, {"errorCode": "APPLICATION_NOT_FOUND"})
+            self._send(200, {"accessToken": "tok", "refreshToken": "r"})
+
+        def do_GET(self):
+            seen["auth"].append(self.headers.get("Authorization"))
+            seen["paths"].append(self.path)
+            if "page=1" in self.path and not seen["throttled"]:
+                seen["throttled"] = True
+                return self._send(429, {"errorCode": "TOO_MANY_REQUESTS"})
+            page = 1 if "page=1" in self.path else 0
+            self._send(200, {"data": pages[page], "meta": {"currentPage": page, "perPage": 2,
+                                                           "totalPageCount": 2, "totalItemCount": 3}})
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    slept = []
+    orig_connect = app.psycopg.connect
+    try:
+        client = monta.Monta("id", "secret", base_url=f"http://127.0.0.1:{server.server_port}",
+                             sleep=slept.append)
+        got = list(client.sessions(from_date="2026-11-01"))
+        if [s["id"] for s in got] != [900000000000000001, 900000000000000002, 900000000000000003]:
+            failures.append(f"  monta paging: got ids {[s['id'] for s in got]}")
+        if not slept:
+            failures.append("  monta: a 429 didn't make the client wait before retrying")
+        if set(seen["auth"]) != {"Bearer tok"}:
+            failures.append(f"  monta: unexpected Authorization headers {set(seen['auth'])}")
+        if not all("fromDate=2026-11-01T00%3A00%3A00Z" in p and "state=completed" in p for p in seen["paths"]):
+            failures.append(f"  monta: filters missing from {seen['paths']}")
+        s = got[0]
+        expect = {"price_incl_vat": 6.17, "price_excl_vat": 5.10, "currency": "EUR",
+                  "charge_point_id": 4242, "energy_kwh": 11.85,
+                  "started_at": datetime(2026, 11, 7, 14, 15, 3, tzinfo=timezone.utc)}
+        bad = {k: s[k] for k in expect if s[k] != expect[k]}
+        if bad:
+            failures.append(f"  monta session(): wrong {bad}")
+        if s["stopped_at"].tzinfo is None or s["stopped_at"].second != 30:
+            failures.append(f"  monta session(): stopped_at {s['stopped_at']!r}")
+        if got[2]["price_excl_vat"] is not None or got[2]["price_per_kwh_incl_vat"] is not None:
+            failures.append("  monta session(): a missing price / zero kWh should give None, not a crash or 0")
+
+        fake = _FakeConnection()
+        app.psycopg.connect = lambda **kwargs: fake
+
+        class _Client:
+            def sessions(self, **kwargs):
+                return iter(got)
+
+        n = app.sync_monta(_Client())
+        sql, params = fake.cursor_obj.executed[0]
+        if n != 3 or len(fake.cursor_obj.executed) != 3:
+            failures.append(f"  sync_monta: wrote {n} / executed {len(fake.cursor_obj.executed)}, expected 3")
+        if f"INSERT INTO {app.MONTA_TABLE}" not in sql or "ON CONFLICT (id) DO UPDATE" not in sql:
+            failures.append(f"  sync_monta: unexpected SQL {sql}")
+        row = dict(zip(app.MONTA_COLUMNS, params))
+        if row["id"] != 900000000000000001 or json.loads(row["raw"])["cost"] != 3.53:
+            failures.append(f"  sync_monta: unexpected params {row}")
+    except Exception as e:
+        failures.append(f"  monta: {type(e).__name__}: {e}")
+    finally:
+        app.psycopg.connect = orig_connect
+        server.shutdown()
+
+    if len(failures) == before:
+        print("  monta: token + paging + 429 retry, session flattening (excl. VAT, UTC times), sync upsert")
+
+
 def _timeout_handler(signum, frame):
     print(f"SMOKE TEST FAILED: exceeded overall {OVERALL_TIMEOUT_S}s timeout (a check likely hung)", file=sys.stderr)
     os._exit(1)
@@ -1726,6 +1834,7 @@ def main():
     check_publishable_fields(failures)
     check_pvoutput_interval_guard(failures)
     check_log_level(failures)
+    check_monta(failures)
 
     signal.alarm(0)
 
@@ -1739,7 +1848,7 @@ def main():
           "P1 relay broadcast, P1 stall reconnect, plug parsing, DSMR timestamps (incl. DST fall-back), "
           "smart-meter source stability, pvoutput metrics, daily generation yield correction, "
           "derived fields, solar staleness fallback, "
-          "telegram buffer cap, publishable fields, pvoutput interval guard, log level")
+          "telegram buffer cap, publishable fields, pvoutput interval guard, log level, monta")
     return 0
 
 

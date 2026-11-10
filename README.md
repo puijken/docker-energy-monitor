@@ -69,6 +69,7 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `POSTGRES_PASSWORD` | *required* | Database password |
 | `POSTGRES_TABLE` | `solar` | Table name written to for inverter readings |
 | `WRITE_QUEUE_SIZE` | `2000` | Max points buffered for the Postgres writer thread. While the database is unreachable the writer holds its current point and retries (1 s → 30 s backoff), so this queue is what bridges the outage; at a few points per second the default covers roughly half an hour. Past that the oldest queued point is dropped first rather than growing without bound. A point the database *rejects* (bad data, unknown column) is logged and dropped at once, so it can't block the ones behind it. |
+| `SHUTDOWN_DRAIN_TIMEOUT` | `5` | Seconds a requested stop (`SIGTERM`/`SIGINT`, i.e. `docker stop`) waits for queued points to reach Postgres before exiting anyway. Normally the queue is all but empty and the container stops in well under a second. Keep it below the stop grace period (`docker stop` allows 10 s by default); anything still unwritten when it runs out is logged as a warning and lost, which only happens when the database is unreachable at that moment. |
 | `MQTT_HOST` | *required if MQTT is used* | Broker hostname/IP. Only required when `ENABLE_MQTT_PUBLISH` or `ENABLE_PLUGS` is on; with both off the container never connects to a broker at all. |
 | `MQTT_PORT` | `1883` | MQTT broker port |
 | `MQTT_USERNAME` | *(none)* | MQTT username, if required |
@@ -478,6 +479,11 @@ decode path and has grown alongside the features above:
 - **Postgres write retry**: `app._write_until_done()` keeps a point through a connection-level
   failure (backoff, fresh connection each attempt) and drops a point the database rejects without
   retrying it.
+- **Clean stop**: the real `app.py` run as a subprocess must exit 0 within seconds of a `SIGTERM`,
+  and `app.drain_write_queue()` must wait for queued and in-flight points, stay bounded when
+  nothing is writing, and not be thrown off by a point evicted from a full queue. The process is
+  PID 1 in its container, where an unhandled `SIGTERM` is ignored: every `docker stop` used to
+  wait out its grace period and then kill it.
 - **P1 telegram ingestion**: framing and CRC verification across split reads and a corrupted
   telegram, OBIS parsing into electricity/gas readings, and a connection that stays open but stops
   delivering — `p1_reader_loop` must tear it down and rebuild it rather than waiting on it forever.

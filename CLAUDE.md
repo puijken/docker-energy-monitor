@@ -109,6 +109,15 @@ classes, just module-level globals guarded by `_state_lock` (or their own dedica
   this repo: the Dockerfile downloads it from github.com/puijken/stroohm-monta-api at a pinned
   commit (`STROOHM_MONTA_API_REF`). Change it there, then bump the ref here.
 
+- **Stopping** — the `__main__` block installs `_request_stop` for `SIGTERM`/`SIGINT` and wraps
+  `main()`. The handler raises `_StopRequested` in the main thread (a `BaseException`, so the
+  poll loop's `except Exception` can't swallow it); `shutdown()` then calls
+  `drain_write_queue(SHUTDOWN_DRAIN_TIMEOUT)` and exits 0. The drain watches
+  `_write_queue.unfinished_tasks`, which is why `pg_writer_loop` and the eviction in
+  `queue_write` both call `task_done()` — keep that pairing if either changes. The process is
+  PID 1, where a signal without a handler is ignored rather than fatal: before this, every
+  `docker stop` took the full grace period and ended in a kill.
+
 `_handle_p1_telegram` runs on `p1_reader_loop`'s own thread, which is the *other* trigger for
 `power_flow` writes (see README's "Why power_flow updates from two triggers") — so `_state_lock`
 covers cross-thread reads of `latest_values`/`latest_poll_monotonic` from both the poll loop and

@@ -28,6 +28,10 @@ surface at runtime. This file now additionally covers, all without a real broker
     CONFLICT clause, a known column routed into `extra` or vice versa).
   - Postgres write retry: app._write_until_done() keeps a point through a connection-level
     failure (backoff, fresh connection) and drops one the database rejects, without retrying it.
+  - Clean stop: the real app.py, run as a subprocess, exits 0 promptly on SIGTERM (it is PID 1 in
+    its container, where an unhandled SIGTERM is simply ignored), and app.drain_write_queue()
+    waits for queued and in-flight points, is bounded when nothing writes, and keeps its count
+    right when a full queue evicts a point.
   - psycopg + the Postgres read path: app.get_last_gas_reading() likewise, against a fake
     connection that returns a canned row.
   - Smart-plug MQTT message handling: app._on_mqtt_message() against real captured Zigbee2MQTT
@@ -74,8 +78,10 @@ loudly instead of stalling CI.
 import json
 import logging
 import os
+import queue
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -702,6 +708,105 @@ def check_postgres_write_retry(failures):
         print("  postgres write retry: point kept through a connection outage (1s/2s backoff, fresh "
               "connection), rejected point dropped without retry")
 
+
+def check_clean_stop(failures):
+    """SIGTERM ends the process promptly and cleanly, and the shutdown flush waits for the writer.
+
+    Two halves. The signal path runs the real app.py as a subprocess, because a handler and the
+    `__main__` wiring around main() can't be exercised by calling functions. The flush path runs
+    the real queue_write()/pg_writer_loop()/drain_write_queue() against a fake connection.
+    """
+    before = len(failures)
+
+    # 1. Signal path. Everything optional is switched off and the inverter port has no listener,
+    #    so main() sits in its poll loop failing to connect -- which is all this needs.
+    child_env = dict(os.environ, LOG_LEVEL="INFO", INVERTER_PORT="9", SCAN_INTERVAL="30",
+                     ENABLE_P1="false", ENABLE_P1_RELAY="false", ENABLE_PLUGS="false",
+                     ENABLE_MQTT_PUBLISH="false", ENABLE_PVOUTPUT="false",
+                     ENABLE_MINDERGAS="false", ENABLE_MONTA="false", PYTHONUNBUFFERED="1")
+    proc = subprocess.Popen([sys.executable, os.path.abspath(app.__file__)], env=child_env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    lines = []
+
+    def _collect_output():
+        for line in proc.stdout:
+            lines.append(line)
+
+    reader = threading.Thread(target=_collect_output, daemon=True)
+    reader.start()
+    try:
+        deadline = time.monotonic() + 15
+        # "Inverter poll failed" means main() is past startup and inside its loop.
+        while time.monotonic() < deadline and not any("Inverter poll failed" in l for l in lines):
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        if proc.poll() is not None:
+            failures.append(f"  clean stop: app.py exited on its own ({proc.returncode}) before "
+                            f"the signal: {''.join(lines)[-400:]!r}")
+        elif not any("Inverter poll failed" in l for l in lines):
+            failures.append("  clean stop: app.py never reached its poll loop within 15s")
+        else:
+            sent = time.monotonic()
+            proc.send_signal(signal.SIGTERM)
+            try:
+                code = proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                failures.append("  clean stop: app.py still running 8s after SIGTERM")
+            else:
+                took = time.monotonic() - sent
+                # Without the handler a non-PID-1 process dies *from* the signal (-15); 0 proves
+                # the handler ran and the process chose to exit.
+                if code != 0:
+                    failures.append(f"  clean stop: exit status {code} after SIGTERM, expected 0 "
+                                    f"(-15 means the signal was not handled)")
+                if took > 3:
+                    failures.append(f"  clean stop: took {took:.1f}s to exit with an empty queue")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        reader.join(timeout=2)
+
+    # 2. Flush path, on a private queue so nothing leaks into (or from) the other checks.
+    orig_queue, orig_conn = app._write_queue, app._pg_conn
+    try:
+        app._write_queue = queue.Queue(maxsize=2)
+        fake_conn = _FakeConnection()
+        app._pg_conn = fake_conn
+        for n in (1, 2, 3):  # the third evicts the first
+            app.queue_write({"total_active_power": float(n)}, 1732900000000000000 + n,
+                            app.POSTGRES_TABLE, "sungrow_test")
+        if app._write_queue.unfinished_tasks != 2:
+            failures.append(f"  drain: an evicted point is still counted as pending "
+                            f"(unfinished_tasks={app._write_queue.unfinished_tasks}, expected 2); "
+                            f"the shutdown flush would always run out its timeout")
+
+        # Nothing is writing yet: the drain must give up at its timeout and report what is left.
+        started = time.monotonic()
+        left = app.drain_write_queue(0.3)
+        waited = time.monotonic() - started
+        if left != 2 or not 0.25 <= waited < 2:
+            failures.append(f"  drain: with no writer expected 2 left after ~0.3s, got {left} "
+                            f"after {waited:.2f}s")
+
+        # With the writer running it must return 0 once both points are in the database. The
+        # thread is a daemon blocked on this private queue afterwards; it never touches the
+        # real one.
+        threading.Thread(target=app.pg_writer_loop, daemon=True).start()
+        left = app.drain_write_queue(5)
+        written = [params[3] for _sql, params in fake_conn.cursor_obj.executed]
+        if left != 0 or written != [2.0, 3.0]:
+            failures.append(f"  drain: expected 0 left and points [2.0, 3.0] written, got {left} "
+                            f"left and {written!r}")
+    except Exception as exc:
+        failures.append(f"  drain_write_queue() raised {exc!r}")
+    finally:
+        app._write_queue, app._pg_conn = orig_queue, orig_conn
+
+    if len(failures) == before:
+        print("  clean stop: SIGTERM exits 0 promptly; shutdown flush waits for the writer, is "
+              "bounded without one, and discounts an evicted point")
 
 
 def check_get_last_gas_reading(failures):
@@ -1793,6 +1898,7 @@ def main():
     check_mqtt_publish_switch(failures)
     check_postgres_write(failures)
     check_postgres_write_retry(failures)
+    check_clean_stop(failures)
     check_get_last_gas_reading(failures)
     check_p1_telegram_parsing(failures)
     check_p1_relay_broadcast(failures)
@@ -1818,7 +1924,7 @@ def main():
         return 1
 
     print("smoke test passed: modbus, inverter reconnect after broken pipe, mqtt connect, mqtt publish switch, "
-          "postgres write, postgres write retry, postgres read, P1 telegram parsing, "
+          "postgres write, postgres write retry, clean stop, postgres read, P1 telegram parsing, "
           "P1 relay broadcast, P1 stall reconnect, plug parsing, DSMR timestamps (incl. DST fall-back), "
           "smart-meter source stability, pvoutput metrics, daily generation yield correction, "
           "derived fields, solar staleness fallback, "

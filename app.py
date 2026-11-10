@@ -4,6 +4,7 @@ import logging
 import os
 import queue
 import re
+import signal
 import socket
 import sys
 import threading
@@ -1315,6 +1316,9 @@ def queue_write(values, ts_ns, table, source):
         pass
     try:
         _write_queue.get_nowait()
+        # The evicted point will never be written. Count it as done, so unfinished_tasks keeps
+        # meaning "queued or being written" -- drain_write_queue() waits on exactly that.
+        _write_queue.task_done()
     except queue.Empty:
         pass
     log.warning("Postgres write queue full; dropped the oldest queued point")
@@ -1391,7 +1395,64 @@ def pg_writer_loop():
     """
     while True:
         values, ts_ns, table, source = _write_queue.get()
-        _write_until_done(values, ts_ns, table, source)
+        try:
+            _write_until_done(values, ts_ns, table, source)
+        finally:
+            # Written or rejected, this point is finished: see drain_write_queue().
+            _write_queue.task_done()
+
+
+# How long a requested stop waits for queued points to reach Postgres before exiting anyway.
+# Keep it below the stop grace period of whatever runs this (`docker stop` allows 10s by default).
+SHUTDOWN_DRAIN_TIMEOUT = env_int("SHUTDOWN_DRAIN_TIMEOUT", 5)
+
+
+def drain_write_queue(timeout):
+    """Waits up to `timeout` seconds for the writer thread to finish every queued point.
+
+    Returns how many are still unwritten: 0 means everything reached Postgres. A point counts
+    from queue_write() until pg_writer_loop() has written or rejected it, so one that is off the
+    queue but still in flight is waited for too. During a database outage this simply runs out
+    the timeout; those points were going to be lost on exit either way.
+    """
+    deadline = time.monotonic() + timeout
+    while _write_queue.unfinished_tasks and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return _write_queue.unfinished_tasks
+
+
+class _StopRequested(BaseException):
+    """Raised in the main thread by the SIGTERM/SIGINT handler.
+
+    A BaseException on purpose: the poll loop catches Exception around every cycle to survive
+    inverter and network errors, and a stop request must not be swallowed as one of those.
+    """
+
+
+def _request_stop(signum, frame):
+    """Signal handler. Unwinds the main thread out of whatever it is blocked in (the interval
+    sleep, a Modbus read with a 10s timeout) instead of only setting a flag it would notice later.
+
+    This process is PID 1 in its container, and the kernel does not apply a signal's default
+    action to PID 1: without a handler SIGTERM was ignored outright, so every `docker stop` waited
+    out its grace period and then killed the process, along with whatever was still queued.
+    """
+    raise _StopRequested(signal.Signals(signum).name)
+
+
+def shutdown(reason):
+    """Flushes the write queue (bounded by SHUTDOWN_DRAIN_TIMEOUT) and returns the exit status."""
+    # A second signal during the flush must not raise out of it.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    log.info("Stop requested (%s); flushing queued Postgres writes", reason)
+    left = drain_write_queue(SHUTDOWN_DRAIN_TIMEOUT)
+    if left:
+        log.warning("Exiting with %d point(s) not written to Postgres (still unwritten after %ss)",
+                    left, SHUTDOWN_DRAIN_TIMEOUT)
+    else:
+        log.info("Write queue flushed; exiting")
+    return 0
 
 
 def sync_monta(client=None):
@@ -1911,4 +1972,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+    try:
+        main()
+    except _StopRequested as stop:
+        sys.exit(shutdown(stop))

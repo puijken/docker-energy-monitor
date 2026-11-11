@@ -2,5 +2,5 @@
 # has changed across major versions, so this is pinned narrower than this repo's siblings.
 pymodbus>=3.16.1,<3.17.0
 requests~=2.34
-paho-mqtt~=2.1
+paho-mqtt~=2.2
 psycopg[binary]~=3.3

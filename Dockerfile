@@ -1,4 +1,4 @@
-FROM python:3.14-slim
+FROM python:3.15-slim
 LABEL maintainer="puijken"
 LABEL description="Sungrow inverter Modbus reader: writes to TimescaleDB, publishes to MQTT, pushes to PVOutput/Mindergas"
 LABEL org.opencontainers.image.source="https://github.com/puijken/docker-energy-monitor"

@@ -1244,7 +1244,9 @@ def derived_fields(values, elec):
     house_w = grid_w + the battery unit's AC output: the panels feed the house only through the
     unit, so its AC output is everything the house gets that isn't from the grid, whether it came
     from the panels directly or out of the cells. (Before the battery it was solar + grid.) The
-    battery terms go into `extra` so the formula can be checked against the stored row.
+    battery terms go into `extra` so the formula can be checked against the stored row. Limit:
+    10208 only counts output (it stays 0 while the unit charges from AC), so charging from the grid
+    shows up as house use here; in self-consumption mode the unit only charges from the panels.
 
     Every field is omitted rather than zeroed when its inputs aren't known: no fresh electricity
     drops grid_w and house_w, a stale battery poll drops solar_w and house_w.

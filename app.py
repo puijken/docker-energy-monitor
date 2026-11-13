@@ -143,6 +143,15 @@ MQTT_PUBLISH_FIELDS = {f.strip() for f in env("MQTT_PUBLISH_FIELDS", "").split("
 ENABLE_P1 = env_bool("ENABLE_P1", False)
 P1_HOST = env("P1_HOST")
 P1_PORT = env_int("P1_PORT", 2001)
+# Alternative upstream: an HTTP endpoint that returns the meter's latest raw telegram, as P1 dongles
+# with a local API do (HomeWizard's P1 meter: http://<dongle>/api/v1/telegram). When set it replaces
+# P1_HOST/P1_PORT: the dongle then holds the meter's P1 port, so there is no stream to connect to.
+# The telegram arrives byte for byte, CRC included, and goes through the same extract_telegram/
+# _handle_p1_telegram path and the same relay as a streamed one.
+P1_URL = env("P1_URL")
+# Seconds between polls of P1_URL. A DSMR 5 meter sends a telegram every second, and an unchanged
+# response (same telegram) is skipped, so polling at the meter's own rate loses nothing.
+P1_POLL_INTERVAL = env_int("P1_POLL_INTERVAL", 1)
 ELEC_TABLE = env("ELEC_TABLE", "electricity")
 GAS_TABLE = env("GAS_TABLE", "gas_positions")
 # The `source` column value written for smart-meter rows. Still "dsmr" even though nothing goes
@@ -1654,6 +1663,70 @@ def _relay_broadcast(chunk):
                 pass
 
 
+def _drain_p1_buffer(buffer):
+    """Extracts and handles every complete telegram in `buffer`. Returns (remaining bytes, number
+    of telegrams handled). Keeps going as long as the buffer shrinks: a successful parse *and* a
+    discarded CRC failure both consume bytes, so this terminates once nothing more can be extracted
+    from what has been received so far."""
+    handled = 0
+    while True:
+        prev_len = len(buffer)
+        telegram, buffer = extract_telegram(buffer)
+        if telegram is not None:
+            handled += 1
+            try:
+                _handle_p1_telegram(telegram)
+            except Exception:
+                log.exception("Could not process P1 telegram")
+        if len(buffer) == prev_len:
+            return buffer, handled  # no more progress possible until more bytes arrive
+
+
+def p1_http_reader_loop():
+    """Polls P1_URL every P1_POLL_INTERVAL seconds and processes the telegram it returns, when it
+    differs from the previous one.
+
+    Each poll is a fresh request, so the stall problem p1_reader_loop guards against (a connection
+    that stays open and says nothing) can't happen here; what can happen is the dongle answering
+    with the same telegram forever (it lost the meter) or not answering at all. Both are reported
+    once after P1_WARN_AFTER seconds without a new telegram, and once more when telegrams return.
+    The response is relayed whole, so ENABLE_P1_RELAY clients get one complete telegram per new
+    reading, as they would from the meter itself.
+    """
+    last_body = None
+    last_new = time.monotonic()
+    warned = False
+    session = requests.Session()
+    while True:
+        started = time.monotonic()
+        try:
+            resp = session.get(P1_URL, timeout=max(P1_POLL_INTERVAL, 5))
+            resp.raise_for_status()
+            body = resp.content[:P1_MAX_BUFFER_BYTES]
+        except Exception as exc:
+            body = None
+            error = exc
+        if body is not None and body != last_body:
+            last_body = body
+            if ENABLE_P1_RELAY:
+                _relay_broadcast(body)
+            _, handled = _drain_p1_buffer(body)
+            if handled:
+                last_new = time.monotonic()
+                if warned:
+                    log.warning("P1 telegrams from %s are arriving again", P1_URL)
+                    warned = False
+        silent_for = time.monotonic() - last_new
+        if not warned and silent_for >= P1_WARN_AFTER:
+            log.warning(
+                "No new P1 telegram from %s in %.0fs (%s)", P1_URL, silent_for,
+                f"last request failed: {error}" if body is None else "the response did not change"
+                " or held no valid telegram",
+            )
+            warned = True
+        time.sleep(max(0.0, P1_POLL_INTERVAL - (time.monotonic() - started)))
+
+
 def p1_reader_loop():
     """Connects to the P1 relay (P1_HOST:P1_PORT) and processes telegrams as they arrive,
     reconnecting with exponential backoff on any failure -- including a connection that stays open
@@ -1720,17 +1793,7 @@ def p1_reader_loop():
                     delay = 1
                     if ENABLE_P1_RELAY:
                         _relay_broadcast(chunk)
-                    buffer += chunk
-                    while True:
-                        prev_len = len(buffer)
-                        telegram, buffer = extract_telegram(buffer)
-                        if telegram is not None:
-                            try:
-                                _handle_p1_telegram(telegram)
-                            except Exception:
-                                log.exception("Could not process P1 telegram")
-                        if len(buffer) == prev_len:
-                            break  # no more progress possible until more bytes arrive
+                    buffer, _ = _drain_p1_buffer(buffer + chunk)
         except Exception:
             log.warning(
                 "P1 connection to %s:%s failed/dropped, retrying in %ss", P1_HOST, P1_PORT, delay, exc_info=True
@@ -1846,9 +1909,12 @@ def validate_config():
         log.error("MONTA_TIMES=%r is not a comma-separated list of HH:MM times", MONTA_TIMES_RAW)
         sys.exit(1)
 
-    if ENABLE_P1 and not P1_HOST:
-        log.error("ENABLE_P1 is set but P1_HOST is missing")
+    if ENABLE_P1 and not (P1_HOST or P1_URL):
+        log.error("ENABLE_P1 is set but neither P1_URL nor P1_HOST is")
         sys.exit(1)
+
+    if ENABLE_P1 and P1_URL and P1_HOST:
+        log.warning("Both P1_URL and P1_HOST are set; reading P1 from P1_URL, P1_HOST is ignored")
 
     if ENABLE_P1 and P1_STALL_TIMEOUT == float("inf"):
         log.warning(
@@ -1869,14 +1935,13 @@ def validate_config():
 
 def main():
     log.info(
-        "Starting energy-monitor: inverter=%s:%s scan_interval=%ss p1=%s(%s:%s) p1_relay=%s(%s:%s) "
+        "Starting energy-monitor: inverter=%s:%s scan_interval=%ss p1=%s(%s) p1_relay=%s(%s:%s) "
         "mqtt_publish=%s(%s,%s) plugs=%s(%d) pvoutput=%s mindergas=%s monta=%s",
         INVERTER_HOST,
         INVERTER_PORT,
         SCAN_INTERVAL,
         ENABLE_P1,
-        P1_HOST,
-        P1_PORT,
+        P1_URL or f"{P1_HOST}:{P1_PORT}",
         ENABLE_P1_RELAY,
         P1_RELAY_BIND,
         P1_RELAY_PORT,
@@ -1907,7 +1972,7 @@ def main():
     if ENABLE_MONTA:
         threading.Thread(target=monta_loop, daemon=True).start()
     if ENABLE_P1:
-        threading.Thread(target=p1_reader_loop, daemon=True).start()
+        threading.Thread(target=p1_http_reader_loop if P1_URL else p1_reader_loop, daemon=True).start()
     if ENABLE_P1_RELAY:
         threading.Thread(target=p1_relay_accept_loop, daemon=True).start()
 

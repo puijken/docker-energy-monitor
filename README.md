@@ -80,8 +80,10 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `MQTT_ELEC_TOPIC_PREFIX` | `energy/electricity` | Topic prefix for **smart-meter electricity** readings, published at `P1_MIN_INTERVAL` cadence. Only produces anything when `ENABLE_P1` is on. Gas and plug data are not published. |
 | `MQTT_PUBLISH_FIELDS` | *(all)* | Comma-separated **inverter** field names to publish, e.g. `total_active_power,run_state`. Leave unset to publish everything. Applies to the inverter topic tree only, not `MQTT_ELEC_TOPIC_PREFIX`. These are the field names as published, which are not quite the register names: use `run_state`, not the raw `work_state_1` it is decoded from, and `total_power_yields_precise` is available even though it is not part of the main register block. Unrecognised names are warned about at startup. |
 | `ENABLE_P1` | `false` | Connect to a P1 telegram relay for smart-meter data. See [Smart-meter data](#smart-meter-data). |
-| `P1_HOST` | *required if `ENABLE_P1=true`* | Host/IP of the P1 telegram relay |
+| `P1_HOST` | *required if `ENABLE_P1=true` and `P1_URL` is unset* | Host/IP of the P1 telegram relay |
 | `P1_PORT` | `2001` | Port of the P1 telegram relay |
+| `P1_URL` | *(unset)* | Read the telegram over HTTP from a P1 dongle's local API instead (e.g. HomeWizard P1 meter: `http://<dongle>/api/v1/telegram`). Replaces `P1_HOST`/`P1_PORT`. See [Reading P1 from a dongle's HTTP API](#reading-p1-from-a-dongles-http-api) |
+| `P1_POLL_INTERVAL` | `1` | Seconds between polls of `P1_URL` |
 | `ELEC_TABLE` | `electricity` | Table for electricity readings |
 | `GAS_TABLE` | `gas_positions` | Table for gas readings |
 | `P1_WARN_AFTER` | `60` | Seconds without a telegram before warning the connection looks stalled |
@@ -236,6 +238,21 @@ own reads, so a stall that isn't recovered takes their feed down too.
 
 Setting `P1_STALL_TIMEOUT=0` restores the old wait-forever behaviour and logs a warning at startup
 saying so. There is no good reason to.
+
+### Reading P1 from a dongle's HTTP API
+
+When a Wi-Fi P1 dongle holds the meter's P1 port, there is no telegram stream to connect to. Some
+dongles return the latest raw telegram over a local HTTP API instead; HomeWizard's P1 meter does at
+`/api/v1/telegram` once its local API is switched on in the HomeWizard app. With `P1_URL` set,
+`p1_http_reader_loop` polls that every `P1_POLL_INTERVAL` seconds and treats the response exactly
+like a streamed telegram: same CRC check, same parser, same `source` label, and with
+`ENABLE_P1_RELAY` the same relay to downstream readers, one whole telegram per new reading.
+
+A response identical to the previous one is the same telegram and is skipped, so polling at the
+meter's own rate (once a second for DSMR 5) neither duplicates nor drops readings in practice. The
+stall reconnect below doesn't apply, since each poll is a fresh request; `P1_WARN_AFTER` still
+reports when no new telegram has arrived for that long, whether the dongle stopped answering or
+keeps answering with the same one.
 
 ### Sharing the P1 port with something else that also reads it
 

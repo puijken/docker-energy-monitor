@@ -361,6 +361,11 @@ use. The panels reach the house only through the unit, so its AC output is every
 that isn't from the grid. `battery_ac_w` and `battery_w` (power at the cells) are stored in the
 row's `extra` so the formula can be checked afterwards.
 
+One limit, measured: register 10208 only counts output. While the unit charged at 800 W from AC it
+stayed 0, so whenever the battery charges from the grid, `house_w` includes that charging power.
+In self-consumption mode it charges from the panels only, so this doesn't arise in normal use.
+Daily totals downstream can subtract the unit's AC-input counter (10030, `socket_energy_in`).
+
 ## Smart plugs (Zigbee2MQTT)
 
 Optionally submeters individual circuits from metering Zigbee smart plugs published by

@@ -1116,6 +1116,66 @@ def check_p1_stall_reconnect(failures):
               f"connects seen), instead of waiting on it forever")
 
 
+def check_p1_http_reader(failures):
+    """app.p1_http_reader_loop(): reading the telegram from a dongle's HTTP API (P1_URL) instead of
+    a stream. Runs the real loop against a real local HTTP server and checks the three things that
+    matter: a telegram is handled once however often it is polled (the dongle keeps answering with
+    the latest one until the meter sends the next), a new telegram is handled when it appears, and
+    the relay gets each new telegram whole and only once.
+    """
+    import http.server
+
+    before = len(failures)
+    served = {"body": _p1_telegram_bytes()}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = served["body"]
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    handled, relayed = [], []
+    saved = (app._handle_p1_telegram, app._relay_broadcast, app.P1_URL, app.P1_POLL_INTERVAL,
+             app.ENABLE_P1_RELAY, app.P1_WARN_AFTER)
+    app._handle_p1_telegram = handled.append
+    app._relay_broadcast = relayed.append
+    app.P1_URL = f"http://127.0.0.1:{server.server_address[1]}/api/v1/telegram"
+    app.P1_POLL_INTERVAL, app.ENABLE_P1_RELAY, app.P1_WARN_AFTER = 1, True, 3600
+    try:
+        threading.Thread(target=app.p1_http_reader_loop, daemon=True).start()
+        time.sleep(2.5)  # three polls of the same telegram
+        if len(handled) != 1 or len(relayed) != 1:
+            failures.append(f"  P1 over HTTP: same telegram polled 3 times gave {len(handled)} handled / "
+                            f"{len(relayed)} relayed, expected 1 / 1")
+        second = _p1_telegram_bytes(_P1_TELEGRAM_BODY.replace("00.417*kW", "00.523*kW"))
+        served["body"] = second
+        time.sleep(1.5)
+        if len(handled) != 2:
+            failures.append(f"  P1 over HTTP: a new telegram was not handled ({len(handled)} handled, expected 2)")
+        elif "00.523" not in handled[1]:
+            failures.append(f"  P1 over HTTP: second telegram handled is not the new one: {handled[1][:80]!r}")
+        if relayed[-1:] != [second]:
+            failures.append("  P1 over HTTP: the relay did not get the new telegram whole")
+    finally:
+        # The loop has no stop signal and outlives the check, like p1_reader_loop in the stall
+        # check. Restoring the handler is safe: the served telegram no longer changes, so it is never
+        # called again, and P1_WARN_AFTER stays large so it can't warn during the remaining checks.
+        (app._handle_p1_telegram, app._relay_broadcast, app.P1_URL, app.P1_POLL_INTERVAL,
+         app.ENABLE_P1_RELAY) = saved[:5]
+
+    if len(failures) == before:
+        print("  P1 over HTTP: one telegram handled and relayed once however often it is polled, "
+              "a new one picked up on the next poll")
+
+
 def check_p1_relay_broadcast(failures):
     """app._relay_broadcast(): the P1 fan-out relay this container runs so DSMR-reader (or
     anything else) can get the telegram stream from *this* container instead of a second direct
@@ -1903,6 +1963,7 @@ def main():
     check_p1_telegram_parsing(failures)
     check_p1_relay_broadcast(failures)
     check_p1_stall_reconnect(failures)
+    check_p1_http_reader(failures)
     check_plug_mqtt_message(failures)
     check_dsmr_timestamp_parsing(failures)
     check_smart_meter_source_is_stable(failures)
@@ -1925,7 +1986,7 @@ def main():
 
     print("smoke test passed: modbus, inverter reconnect after broken pipe, mqtt connect, mqtt publish switch, "
           "postgres write, postgres write retry, clean stop, postgres read, P1 telegram parsing, "
-          "P1 relay broadcast, P1 stall reconnect, plug parsing, DSMR timestamps (incl. DST fall-back), "
+          "P1 relay broadcast, P1 stall reconnect, P1 over HTTP, plug parsing, DSMR timestamps (incl. DST fall-back), "
           "smart-meter source stability, pvoutput metrics, daily generation yield correction, "
           "derived fields, solar staleness fallback, "
           "telegram buffer cap, publishable fields, pvoutput interval guard, log level, monta")

@@ -6,7 +6,7 @@ only fails when it first talks to hardware -- which has already happened once (p
 dropped the `slave` keyword in favour of `device_id`).
 
 Originally this only covered pymodbus (start an in-process Modbus server, poll it through
-app.poll_inverter, check the decoded values). Dependabot auto-merges non-major bumps to
+app.poll_inverter, check the decoded values; since the battery swap, app.poll_battery). Dependabot auto-merges non-major bumps to
 paho-mqtt, requests and psycopg too, so an API change in any of them would also pass CI and only
 surface at runtime. This file now additionally covers, all without a real broker or Postgres:
 
@@ -60,12 +60,10 @@ surface at runtime. This file now additionally covers, all without a real broker
     from this container instead of a second direct connection to ser2net, which does not actually
     grant concurrent access to one serial device (see the ENABLE_P1 comment in app.py).
   - The PVOutput metric formulas in app.METRICS, and that build_pvoutput_params() degrades to
-    inverter-only output when no electricity data is cached.
-  - The daily-generation-yield correction (app._daily_generation_wh_corrected(), for
-    daily_power_yields periodically failing to reset at local midnight): a cached baseline is used
-    without touching Postgres, a cache miss queries and caches app.get_daily_yield_baseline(), and
-    both a missing baseline row and PVOUTPUT_USE_RAW_DAILY_YIELD=True fall back to the raw
-    register.
+    battery-only output when no electricity data is cached; power_flow's house_w = grid + the
+    battery unit's AC output.
+  - The daily yield (app.daily_yield_kwh()): a cached baseline is used without touching Postgres, a
+    cache miss queries and caches app.get_daily_yield_baseline(), no baseline gives None.
   - Stroohm/Monta (ENABLE_MONTA): that the stroohm_monta_api.py downloaded at build still gives the
     session fields app.sync_monta() relies on, sync_monta()'s upsert against a fake Postgres
     connection, and MONTA_TIMES parsing / due-slot selection. The API client's own behaviour
@@ -88,8 +86,8 @@ import time
 from datetime import datetime, timezone
 from queue import Empty
 
-os.environ.setdefault("INVERTER_HOST", "127.0.0.1")
-os.environ.setdefault("INVERTER_PORT", "15020")
+os.environ.setdefault("BATTERY_HOST", "127.0.0.1")
+os.environ.setdefault("BATTERY_PORT", "15020")
 os.environ.setdefault("POSTGRES_HOST", "127.0.0.1")
 os.environ.setdefault("POSTGRES_USER", "smoke")
 os.environ.setdefault("POSTGRES_PASSWORD", "smoke")
@@ -101,94 +99,99 @@ from pymodbus.server import StartTcpServer  # noqa: E402
 import app  # noqa: E402
 import paho.mqtt.client as mqtt  # noqa: E402
 
-PORT = int(os.environ["INVERTER_PORT"])
+PORT = int(os.environ["BATTERY_PORT"])
 
 OVERALL_TIMEOUT_S = 60
 
-# Raw register values, indexed by wire address (protocol address - 1), chosen so every decode path
-# is exercised: U16 with scaling, S16, and U32 low/high word assembly.
+def _words32(value):
+    """A signed or unsigned 32-bit value as the Solarbank sends it: high word first."""
+    value &= 0xFFFFFFFF
+    return [value >> 16, value & 0xFFFF]
+
+
+# Raw register values by wire address, in the Solarbank's own layout (big-endian, high word first),
+# chosen so every decode path is exercised: u16, signed and unsigned 32-bit, negative values, the
+# registers read on their own, and a holding register. Values from a real afternoon reading.
 RAW = {
-    5002: 83,       # daily_power_yields   U16 x0.1 -> 8.3 kWh
-    5003: 26261,    # total_power_yields   U32 low
-    5004: 0,        #                      U32 high -> 26261 kWh (unscaled)
-    5005: 18173,    # total_running_time   U32 low
-    5006: 0,        #                      U32 high -> 18173 h
-    5007: 571,      # internal_temperature S16 x0.1 -> 57.1 C
-    5008: 2990,     # total_apparent_power U32 low
-    5009: 0,        #                      U32 high -> 2990 VA
-    5010: 2567,     # mppt_1_voltage       -> 256.7 V
-    5011: 29,       # mppt_1_current       -> 2.9 A
-    5012: 2317,     # mppt_2_voltage       -> 231.7 V
-    5013: 95,       # mppt_2_current       -> 9.5 A
-    5016: 2968,     # total_dc_power       U32 low
-    5017: 0,        #                      U32 high -> 2968 W
-    5018: 2378,     # phase_a_voltage      -> 237.8 V
-    5021: 122,      # phase_a_current      S16 x0.1 -> 12.2 A
-    5030: 2888,     # total_active_power   U32 low
-    5031: 0,        #                      U32 high -> 2888 W
-    5037: 0x0000,   # work_state_1         U16 -> 0x0000 "Run"
-    5143: 471,      # fine total yield     U32 low  (FINE_TOTAL_YIELD_REGISTER, polled separately
-    5144: 4,        #                      U32 high  from the block above) -> 26261.5 kWh x0.1
+    10001: 1,                              # status: charging
+    **dict(zip((10002, 10003), _words32(2350))),    # PV power
+    **dict(zip((10004, 10005), _words32(0))),       # third-party PV
+    **dict(zip((10008, 10009), _words32(-1820))),   # battery power: charging 1820 W
+    **dict(zip((10010, 10011), _words32(450))),     # load (from the unit's CT meter)
+    **dict(zip((10012, 10013), _words32(-15))),     # grid (from the unit's CT meter)
+    10014: 63,                              # SOC
+    10015: 100,                             # SOH
+    **dict(zip((10018, 10019), _words32(87))),      # PV total, 0.1 kWh -> 8.7
+    **dict(zip((10026, 10027), _words32(22))),      # own use 2.2 kWh
+    **dict(zip((10030, 10031), _words32(51))),      # socket energy in 5.1 kWh
+    **dict(zip((10036, 10037), _words32(3500))),
+    **dict(zip((10038, 10039), _words32(3500))),
+    10156: 241,                             # temperature 24.1 C (read on its own)
+    10199: 2264, 10205: 196, 10213: 4998, 10224: 56, 10227: 56,
+    **dict(zip((10208, 10209), _words32(430))),     # AC output into the house
+    **dict(zip((10210, 10211), _words32(12))),
+    **dict(zip((10250, 10251), _words32(71))),
+    **dict(zip((10254, 10255), _words32(1790))),    # cell power (read on its own)
+    **dict(zip((10262, 10263), _words32(132))),     # charged 13.2 kWh
+    **dict(zip((10264, 10265), _words32(17))),      # discharged 1.7 kWh
 }
-EXPECTED = {
-    "daily_power_yields": 8.3,
-    "total_power_yields": 26261,
-    "total_running_time": 18173,
-    "internal_temperature": 57.1,
-    "total_apparent_power": 2990,
-    "mppt_1_voltage": 256.7,
-    "mppt_1_current": 2.9,
-    "mppt_2_voltage": 231.7,
-    "mppt_2_current": 9.5,
-    "total_dc_power": 2968,
-    "phase_a_voltage": 237.8,
-    "phase_a_current": 12.2,
-    "total_active_power": 2888,
-    "run_state": "Run",
-    "total_power_yields_precise": 26261.5,
+HOLDING = {10064: 0, 60000: 100, 60001: 5, 60002: 20, 60003: 0}   # self-consumption, SOC limits
+PV_OFFSET = 27866.6
+EXPECTED_SOLAR = {
+    "total_active_power": 2350,
+    "total_power_yields": 27875.3,
+    "total_power_yields_precise": 27875.3,
+}
+EXPECTED_BATTERY = {
+    "soc": 63, "battery_power": -1820, "pv_power": 2350, "third_party_pv_power": 0,
+    "load_power": 450, "grid_power": -15, "ac_output_power": 430, "charge_energy_total": 13.2,
+    "discharge_energy_total": 1.7, "pv_energy_total": 8.7, "status": "charging",
+    "operating_mode": "self_consumption", "soh": 100, "ac_voltage": 226.4, "ac_current": 1.96,
+    "frequency": 49.98, "temperature": 24.1, "ac_power": 1790, "socket_energy_in": 5.1,
+    "own_use_energy": 2.2, "max_charge_power": 3500, "rated_energy": 7.1, "charge_limit_soc": 100,
+    "discharge_limit_soc": 5, "backup_reserve_soc": 20, "backup_reserve_enabled": 0,
 }
 
 
 def serve():
-    """Serve RAW over Modbus TCP.
+    """Serve RAW (input registers) and HOLDING over Modbus TCP.
 
     Only the test harness uses pymodbus's server API, which is the volatile part: 3.14 renamed
     ModbusSlaveContext to ModbusDeviceContext, and v4 will drop these in favour of SimData/SimDevice
     (hence the deprecation warnings). If a bump breaks *this* function rather than an assertion, the
     harness needs updating, not the app.
     """
-    regs = [0] * (max(RAW) + 8)
-    for address, value in RAW.items():
-        regs[address] = value
-    # ModbusSequentialDataBlock stores at address-1, so 1 maps regs[i] to wire address i.
-    block = ModbusSequentialDataBlock(1, regs)
+    def block(values):
+        regs = [0] * (max(values) + 8)
+        for address, value in values.items():
+            regs[address] = value
+        # ModbusSequentialDataBlock stores at address-1, so 1 maps regs[i] to wire address i.
+        return ModbusSequentialDataBlock(1, regs)
+
     try:  # pymodbus >= 3.14
         from pymodbus.datastore import ModbusDeviceContext
 
-        context = ModbusServerContext(devices=ModbusDeviceContext(ir=block), single=True)
+        context = ModbusServerContext(devices=ModbusDeviceContext(ir=block(RAW), hr=block(HOLDING)), single=True)
     except ImportError:  # older pymodbus
         from pymodbus.datastore import ModbusSlaveContext
 
-        context = ModbusServerContext(slaves=ModbusSlaveContext(ir=block, zero_mode=True), single=True)
+        context = ModbusServerContext(
+            slaves=ModbusSlaveContext(ir=block(RAW), hr=block(HOLDING), zero_mode=True), single=True)
     StartTcpServer(context=context, address=("127.0.0.1", PORT))
 
 
-_inverter_server_started = False
+_battery_server_started = False
 
 
-def _poll_against_fake_inverter():
-    """One poll against the fake inverter, starting the server on first use.
-
-    Shared so a check can poll without depending on check_modbus_poll having run first -- an
-    ordering dependency between checks has already caused one assertion here to silently never run.
-    Returns None if the server can't be reached.
-    """
-    global _inverter_server_started
+def _poll_against_fake_battery():
+    """One poll against the fake Solarbank, starting the server on first use. Returns
+    (solar, battery), or None if the server can't be reached."""
+    global _battery_server_started
     from pymodbus.client import ModbusTcpClient
 
-    if not _inverter_server_started:
+    if not _battery_server_started:
         threading.Thread(target=serve, daemon=True).start()
-        _inverter_server_started = True
+        _battery_server_started = True
         time.sleep(0.5)  # let it bind first, so the log isn't cluttered with a refused connect
 
     client = ModbusTcpClient("127.0.0.1", port=PORT, timeout=5)
@@ -198,57 +201,56 @@ def _poll_against_fake_inverter():
         time.sleep(0.5)
     else:
         return None
+    orig_offset = app.PV_TOTAL_OFFSET_KWH
+    app.PV_TOTAL_OFFSET_KWH = PV_OFFSET
     try:
-        return app.poll_inverter(client)
+        return app.poll_battery(client)
     finally:
+        app.PV_TOTAL_OFFSET_KWH = orig_offset
         client.close()
 
 
 def check_modbus_poll(failures):
-    """Original coverage: decode registers through app.poll_inverter() against a real pymodbus
-    server, plus the physical-invariant and line-protocol-formatting checks that rely on it."""
-    values = _poll_against_fake_inverter()
-    if values is None:
-        failures.append("  could not connect to the test inverter")
+    """Decode the Solarbank's registers through app.poll_battery() against a real pymodbus server.
+
+    The word order is the trap: the unit sends 32-bit values high word first, and a low-word-first
+    decode gives plausible-looking wrong numbers for small values. The negative battery power and
+    grid values, and the lifetime counters, catch that.
+    """
+    result = _poll_against_fake_battery()
+    if result is None:
+        failures.append("  could not connect to the test battery")
         return
+    solar, battery = result
+    for name, want in EXPECTED_SOLAR.items():
+        if solar.get(name) != want:
+            failures.append(f"  solar {name}: expected {want!r}, got {solar.get(name)!r}")
+    for name, want in EXPECTED_BATTERY.items():
+        if battery.get(name) != want:
+            failures.append(f"  battery {name}: expected {want!r}, got {battery.get(name)!r}")
+    # Physical consistency: the PV going in has to cover what goes into the cells plus what comes
+    # out of the AC side (an afternoon with no grid charging).
+    if solar["total_active_power"] < -battery["battery_power"] + battery["ac_output_power"]:
+        failures.append(f"  PV {solar['total_active_power']} W does not cover charging + AC output")
+    print(f"  modbus poll: {len(EXPECTED_SOLAR) + len(EXPECTED_BATTERY)} values decoded, "
+          f"unit kwarg={app._UNIT_KWARG!r}")
 
-    for name, want in EXPECTED.items():
-        got = values.get(name)
-        if got != want:
-            failures.append(f"  {name}: expected {want!r}, got {got!r}")
 
-    # Physical consistency: DC input must cover AC output, and the MPPT strings must account for
-    # the DC total. Catches sign/word-order/scaling regressions that individual values might hide.
-    dc, ac = values["total_dc_power"], values["total_active_power"]
-    mppt = (
-        values["mppt_1_voltage"] * values["mppt_1_current"]
-        + values["mppt_2_voltage"] * values["mppt_2_current"]
-    )
-    if not ac <= dc:
-        failures.append(f"  AC output {ac}W exceeds DC input {dc}W")
-    if abs(mppt - dc) / dc > 0.05:
-        failures.append(f"  MPPT sum {mppt:.0f}W disagrees with total_dc_power {dc}W by >5%")
-
-    # Apparent power can never be less than active power, and volts times amps on the AC side has
-    # to land back on active power. Both catch a word-order or scaling slip on the registers added
-    # later than the original block, which a single-value comparison would not.
-    va = values["total_apparent_power"]
-    if va < ac:
-        failures.append(f"  apparent power {va}VA is below active power {ac}W")
-    ac_from_vi = values["phase_a_voltage"] * values["phase_a_current"]
-    if abs(ac_from_vi - ac) / ac > 0.05:
-        failures.append(f"  phase A V*I {ac_from_vi:.0f}W disagrees with active power {ac}W by >5%")
-
-    # FINE_TOTAL_YIELD_REGISTER is a separate round trip against the same lifetime counter as
-    # total_power_yields, just 0.1 kWh-scaled -- the two must agree to within the coarse register's
-    # own 1 kWh rounding, or a word-order/scale slip on the new register would silently ship.
-    coarse, fine = values["total_power_yields"], values.get("total_power_yields_precise")
-    if fine is None:
-        failures.append("  total_power_yields_precise missing (fine-yield register read failed)")
-    elif abs(fine - coarse) > 1:
-        failures.append(f"  fine total yield {fine}kWh disagrees with coarse {coarse}kWh by >1kWh")
-
-    print(f"  modbus poll: {len(EXPECTED)} values decoded, unit kwarg={app._UNIT_KWARG!r}")
+def check_battery_is_read_only(failures):
+    """app._read() must refuse anything but function codes 3 and 4: the unit's operating mode,
+    power setpoint and charge limits are writable registers, and nothing here may write."""
+    class _Client:
+        def read_holding_registers(self, *a, **k):
+            raise AssertionError("not reached")
+        read_input_registers = read_holding_registers
+    for function in (6, 16):
+        try:
+            app._read(_Client(), function, 10064, 1)
+            failures.append(f"  _read() accepted function code {function}")
+        except KeyError:
+            pass
+    if not any(f.startswith("  _read() accepted") for f in failures):
+        print("  read-only: _read() refuses write function codes")
 
 
 def check_inverter_reconnect_after_broken_pipe(failures):
@@ -589,7 +591,7 @@ def check_postgres_write(failures):
     ts_ns = 1732900000123456789
     try:
         app.write_postgres(
-            {"total_active_power": 2888.0, "run_state": "ON", "not_a_real_column": 1.5},
+            {"total_active_power": 2888.0, "daily_power_yields": 8.7, "not_a_real_column": 1.5},
             ts_ns,
             table=app.POSTGRES_TABLE,
             source="sungrow_test",
@@ -627,8 +629,8 @@ def check_postgres_write(failures):
         failures.append(
             f"  write_postgres() extra param: expected '{{\"not_a_real_column\": 1.5}}', got {extra_param!r}"
         )
-    if params[3:] != [2888.0, "ON"]:
-        failures.append(f"  write_postgres() known-column params: expected [2888.0, 'ON'], got {params[3:]!r}")
+    if params[3:] != [2888.0, 8.7]:
+        failures.append(f"  write_postgres() known-column params: expected [2888.0, 8.7], got {params[3:]!r}")
 
     if len(failures) == before:
         print("  postgres write: SQL/ON CONFLICT/params as expected, unmapped field routed into `extra`")
@@ -718,9 +720,9 @@ def check_clean_stop(failures):
     """
     before = len(failures)
 
-    # 1. Signal path. Everything optional is switched off and the inverter port has no listener,
+    # 1. Signal path. Everything optional is switched off and the battery port has no listener,
     #    so main() sits in its poll loop failing to connect -- which is all this needs.
-    child_env = dict(os.environ, LOG_LEVEL="INFO", INVERTER_PORT="9", SCAN_INTERVAL="30",
+    child_env = dict(os.environ, LOG_LEVEL="INFO", BATTERY_PORT="9", SCAN_INTERVAL="30",
                      ENABLE_P1="false", ENABLE_P1_RELAY="false", ENABLE_PLUGS="false",
                      ENABLE_MQTT_PUBLISH="false", ENABLE_PVOUTPUT="false",
                      ENABLE_MINDERGAS="false", ENABLE_MONTA="false", PYTHONUNBUFFERED="1")
@@ -736,15 +738,15 @@ def check_clean_stop(failures):
     reader.start()
     try:
         deadline = time.monotonic() + 15
-        # "Inverter poll failed" means main() is past startup and inside its loop.
-        while time.monotonic() < deadline and not any("Inverter poll failed" in l for l in lines):
+        # "Battery poll failed" means main() is past startup and inside its loop.
+        while time.monotonic() < deadline and not any("Battery poll failed" in l for l in lines):
             if proc.poll() is not None:
                 break
             time.sleep(0.05)
         if proc.poll() is not None:
             failures.append(f"  clean stop: app.py exited on its own ({proc.returncode}) before "
                             f"the signal: {''.join(lines)[-400:]!r}")
-        elif not any("Inverter poll failed" in l for l in lines):
+        elif not any("Battery poll failed" in l for l in lines):
             failures.append("  clean stop: app.py never reached its poll loop within 15s")
         else:
             sent = time.monotonic()
@@ -1464,44 +1466,19 @@ def check_telegram_buffer_cap(failures):
 
 
 def check_publishable_fields(failures):
-    """PUBLISHABLE_FIELDS must match what poll_inverter() actually returns.
-
-    validate_config used to check MQTT_PUBLISH_FIELDS against REGISTERS, which is wrong in both
-    directions at once: it accepted work_state_1 (popped before publishing, so naming it publishes
-    nothing, silently) and warned "unknown" for total_power_yields_precise (publishable, but not a
-    REGISTERS entry). Asserted against a real poll rather than by restating the set, so the two drift
-    apart in CI rather than in a deployment.
-    """
-    values = _poll_against_fake_inverter()
-    if values is None:
-        failures.append("  PUBLISHABLE_FIELDS: could not poll the fake inverter to compare against")
+    """PUBLISHABLE_FIELDS must match what the poll loop actually publishes: poll_battery()'s solar
+    values plus daily_power_yields, which the loop adds. Asserted against a real poll rather than by
+    restating the set, so the two can't drift apart unnoticed."""
+    before = len(failures)
+    result = _poll_against_fake_battery()
+    if result is None:
+        failures.append("  publishable fields: could not poll the test battery")
         return
-
-    # total_power_yields_precise is best-effort (separate round trip, absent on firmware without
-    # register 5144), so it is allowed to be in PUBLISHABLE_FIELDS without appearing in a poll.
-    missing = set(values) - app.PUBLISHABLE_FIELDS
-    extra = app.PUBLISHABLE_FIELDS - set(values) - {"total_power_yields_precise"}
-    if missing:
-        failures.append(
-            f"  PUBLISHABLE_FIELDS is missing field(s) poll_inverter() returns: "
-            f"{', '.join(sorted(missing))} -- validate_config would warn 'unknown' for a real field"
-        )
-    if extra:
-        failures.append(
-            f"  PUBLISHABLE_FIELDS claims field(s) poll_inverter() never returns: "
-            f"{', '.join(sorted(extra))} -- validate_config would accept a field that publishes nothing"
-        )
-    if missing or extra:
-        return
-
-    if "work_state_1" in app.PUBLISHABLE_FIELDS:
-        failures.append("  PUBLISHABLE_FIELDS contains work_state_1, which is popped before publishing")
-        return
-    if "run_state" not in app.PUBLISHABLE_FIELDS:
-        failures.append("  PUBLISHABLE_FIELDS is missing run_state, the decoded replacement for work_state_1")
-        return
-    print(f"  publishable fields: {len(app.PUBLISHABLE_FIELDS)} fields match poll_inverter()'s real "
-          "output (work_state_1 excluded, total_power_yields_precise included)")
+    returned = set(result[0]) | {"daily_power_yields"}
+    if returned != app.PUBLISHABLE_FIELDS:
+        failures.append(f"  PUBLISHABLE_FIELDS {sorted(app.PUBLISHABLE_FIELDS)} != published {sorted(returned)}")
+    if len(failures) == before:
+        print(f"  publishable fields: {len(app.PUBLISHABLE_FIELDS)} fields match the real poll")
 
 
 def check_pvoutput_interval_guard(failures):
@@ -1586,282 +1563,164 @@ def check_log_level(failures):
 
 
 def check_derived_fields(failures):
-    """The power_flow point written on each poll, which exists so Grafana never has to join
-    measurements. Reuses the same inverter/electricity fixtures as the metric checks below."""
+    """The power_flow point. House use is grid + the unit's AC output, not PV + grid: with the
+    battery charging, PV + grid would count the energy going into the cells as house use."""
     before = len(failures)
-    inverter = {"total_active_power": 2888}
-    elec = {
-        "electricity_currently_delivered": 0.0,
-        "electricity_currently_returned": 1.644,
-    }
+    values = {"total_active_power": 2350, "ac_output_power": 430, "battery_power": -1820}
+    elec = {"electricity_currently_delivered": 0.0, "electricity_currently_returned": 0.12}
 
-    # solar_w = 2888
-    # grid_w  = (0.0 * 1000) - (1.644 * 1000) = -1644   (negative == feeding the grid)
-    # house_w = 2888 + (0.0 - 1.644) * 1000  =  1244
-    got = app.derived_fields(inverter, elec)
-    for name, want in (("solar_w", 2888.0), ("grid_w", -1644.0), ("house_w", 1244.0)):
-        if got.get(name) != want:
-            failures.append(f"  derived {name}: expected {want}, got {got.get(name)!r}")
+    # grid_w  = 0 - 120 = -120 (exporting)
+    # house_w = -120 + 430 = 310   (PV + grid would have said 2230)
+    got = app.derived_fields(values, elec)
+    want = {"solar_w": 2350.0, "grid_w": -120.0, "house_w": 310.0, "battery_ac_w": 430.0, "battery_w": -1820.0}
+    if got != want:
+        failures.append(f"  derived fields: expected {want}, got {got}")
     if got and not all(isinstance(v, float) for v in got.values()):
         failures.append(f"  derived fields must all be floats, got {got}")
 
-    # Without cached electricity data the grid/house fields must be absent, not zero -- a zero
-    # would render in Grafana as a real "house using nothing" reading.
-    solar_only = app.derived_fields(inverter, None)
-    if set(solar_only) != {"solar_w"}:
-        failures.append(f"  derived fields without electricity: expected only solar_w, got {sorted(solar_only)}")
+    # Without electricity, grid and house are absent, not zero.
+    no_elec = app.derived_fields(values, None)
+    if {"grid_w", "house_w"} & set(no_elec):
+        failures.append(f"  derived fields without electricity kept grid/house: {sorted(no_elec)}")
+    # Without the battery (stale poll), solar and house are absent; grid stays.
+    no_battery = app.derived_fields({}, elec)
+    if set(no_battery) != {"grid_w"}:
+        failures.append(f"  derived fields without the battery: expected only grid_w, got {sorted(no_battery)}")
 
     if len(failures) == before:
-        print("  derived fields: solar/grid/house computed together; omitted (not zeroed) without electricity")
+        print("  derived fields: house = grid + battery AC output; omitted (not zeroed) without either input")
 
 
 def check_solar_stale_fallback(failures):
-    """A stale solar poll is ambiguous, and _solar_power_for_derived() must resolve it from the
-    state the inverter was last seen in rather than by substituting a fixed 0.
-
-    It used to always substitute 0, justified by the inverter going offline overnight. It doesn't:
-    it stays reachable and reports `Standby` at exactly 0 W all night, so nights never depended on
-    the substitution -- it only ever fired on a genuine poll failure, which is exactly when 0 W is
-    wrong. The last case below is the one that matters: a producing array reported as idle makes an
-    exporting house compute as *negative* consumption.
-    """
+    """_battery_values_for_derived(): a fresh poll gives its values, a stale one gives nothing, so
+    power_flow leaves a gap instead of a plausible-looking 0."""
     before = len(failures)
-    orig_latest_values = dict(app.latest_values)
-    orig_latest_poll_monotonic = app.latest_poll_monotonic
-
-    def _set(power, run_state, age):
+    saved = (dict(app.latest_values), app.latest_poll_monotonic)
+    try:
         with app._state_lock:
             app.latest_values.clear()
-            if power is not None:
-                app.latest_values["total_active_power"] = power
-            if run_state is not None:
-                app.latest_values["run_state"] = run_state
-            app.latest_poll_monotonic = None if age is None else time.monotonic() - age
-
-    try:
-        # Fresh poll -> the real value, whatever the state says.
-        _set(2500.0, "Run", 0)
-        got = app._solar_power_for_derived()
-        if got != 2500.0:
-            failures.append(f"  fresh poll: expected 2500.0, got {got!r}")
-
-        # Stale, but last seen idle -> a real 0. This is the night/shutdown case, and the only one
-        # in which substituting zero was ever justified.
-        for state in sorted(app.IDLE_RUN_STATES):
-            _set(0.0, state, app.SOLAR_STALE_AFTER + 1)
-            got = app._solar_power_for_derived()
-            if got != 0.0:
-                failures.append(f"  stale poll, last seen {state!r} (idle): expected 0.0, got {got!r}")
-
-        # Stale, but last seen producing -> unknown. Must NOT claim 0.
-        _set(3000.0, "Run", app.SOLAR_STALE_AFTER + 1)
-        got = app._solar_power_for_derived()
-        if got is not None:
-            failures.append(
-                f"  stale poll, last seen producing at 3000 W: expected None (unknown), got {got!r} "
-                "-- reporting a producing array as idle makes house_w go negative"
-            )
-
-        # An unmapped/unknown state is not on the idle list, so it must also decline to guess.
-        _set(3000.0, "Unknown (0x1234)", app.SOLAR_STALE_AFTER + 1)
-        if app._solar_power_for_derived() is not None:
-            failures.append("  stale poll with an unmapped run_state should be None, not 0.0")
-
-        # No poll at all yet (container just started) -> unknown, not zero.
-        _set(None, None, None)
-        got = app._solar_power_for_derived()
-        if got is not None:
-            failures.append(f"  no poll yet: expected None, got {got!r}")
-
-        # And the consequence end to end: an unknown solar reading drops solar_w and house_w but
-        # keeps grid_w, which comes straight off the meter.
-        elec = {"electricity_currently_delivered": 0.0, "electricity_currently_returned": 0.5}
-        flow = app.derived_fields({"total_active_power": None}, elec)
-        if "solar_w" in flow or "house_w" in flow:
-            failures.append(f"  derived_fields with unknown solar should omit solar_w/house_w, got {flow}")
-        elif flow.get("grid_w") != -500.0:
-            failures.append(f"  derived_fields with unknown solar should still report grid_w=-500.0, got {flow}")
-
-        # The old behaviour, for contrast: 0 W here would have produced house_w = -500 W.
-        old = app.derived_fields({"total_active_power": 0.0}, elec)
-        if old.get("house_w") != -500.0:
-            failures.append(
-                f"  sanity check failed: substituting 0 W should still compute house_w=-500.0, got {old}"
-            )
-
-        if len(failures) == before:
-            print("  solar staleness: resolved from the last run_state -- real 0 when idle, omitted "
-                  "(not zeroed) when it was producing, so house_w can't go negative")
+            app.latest_values.update({"total_active_power": 2350, "ac_output_power": 430,
+                                      "battery_power": -1820, "total_power_yields": 1.0})
+            app.latest_poll_monotonic = time.monotonic()
+        fresh = app._battery_values_for_derived()
+        if fresh != {"total_active_power": 2350, "ac_output_power": 430, "battery_power": -1820}:
+            failures.append(f"  fresh battery poll: got {fresh}")
+        with app._state_lock:
+            app.latest_poll_monotonic = time.monotonic() - app.SOLAR_STALE_AFTER - 1
+        if app._battery_values_for_derived() != {}:
+            failures.append("  stale battery poll must give {}, not the cached values")
+        with app._state_lock:
+            app.latest_poll_monotonic = None
+        if app._battery_values_for_derived() != {}:
+            failures.append("  no poll yet must give {}")
     finally:
         with app._state_lock:
             app.latest_values.clear()
-            app.latest_values.update(orig_latest_values)
-            app.latest_poll_monotonic = orig_latest_poll_monotonic
+            app.latest_values.update(saved[0])
+            app.latest_poll_monotonic = saved[1]
+    if len(failures) == before:
+        print("  battery staleness: fresh poll used, stale or missing poll omitted (not zeroed)")
 
 
 def check_pvoutput_metrics(failures):
     """PVOutput metric formulas in app.METRICS, and build_pvoutput_params() degrading to
-    inverter-only output when no smart-meter data is cached."""
+    battery-only output when no smart-meter data is cached."""
     before = len(failures)
-    inverter = {
-        "daily_power_yields": 8.3,
-        "total_power_yields": 26261,
-        "total_active_power": 2888,
-        "total_dc_power": 2968,
-        "phase_a_voltage": 237.8,
-        "internal_temperature": 57.1,
-    }
+    values = {"daily_power_yields": 8.7, "total_power_yields": 27875.3, "total_active_power": 2350,
+              "ac_output_power": 430, "soc": 63}
     elec = {
         "electricity_currently_delivered": 0.0,
-        "electricity_currently_returned": 1.644,
-        "electricity_delivered_1": 13658.117,
-        "electricity_delivered_2": 11190.901,
-        "electricity_returned_1": 5750.043,
-        "electricity_returned_2": 12043.452,
-        "phase_voltage_l1": 235.0,
+        "electricity_currently_returned": 0.12,
+        "electricity_delivered_1": 14351.805,
+        "electricity_delivered_2": 11749.026,
+        "electricity_returned_1": 6029.28,
+        "electricity_returned_2": 12632.371,
+        "phase_voltage_l1": 225.0,
     }
+    for name, want in (("house_power_w", 310), ("daily_generation_wh", 8700),
+                       ("total_generation_wh", 27875300), ("generation_w", 2350),
+                       ("grid_voltage_v", 225.0), ("battery_soc", 63)):
+        got = app.METRICS[name][1](values, elec)
+        if got != want:
+            failures.append(f"  {name}: expected {want}, got {got}")
 
-    # house_power_w = total_active_power + (currently_delivered - currently_returned) * 1000
-    #               = 2888 + (0.0 - 1.644) * 1000 = 2888 - 1644 = 1244
-    expected_house_power_w = 1244
-    got_house_power_w = app.METRICS["house_power_w"][1](inverter, elec)
-    if got_house_power_w != expected_house_power_w:
-        failures.append(f"  house_power_w: expected {expected_house_power_w}, got {got_house_power_w}")
-
-    # total_house_energy_wh = total_power_yields*1000 + (delivered_1+delivered_2)*1000
-    #                                                  - (returned_1+returned_2)*1000
-    #   delivered_1+delivered_2 = 13658.117 + 11190.901 = 24849.018 -> *1000 = 24849018
-    #   returned_1+returned_2  =  5750.043 + 12043.452  = 17793.495 -> *1000 = 17793495
-    #   total = 26261*1000 + 24849018 - 17793495 = 26261000 + 24849018 - 17793495 = 33316523
-    expected_total_house_energy_wh = 33316523
-    got_total_house_energy_wh = app.METRICS["total_house_energy_wh"][1](inverter, elec)
-    if got_total_house_energy_wh != expected_total_house_energy_wh:
-        failures.append(
-            f"  total_house_energy_wh: expected {expected_total_house_energy_wh}, got {got_total_house_energy_wh}"
-        )
-
-    # build_pvoutput_params() must drop parameters that need electricity data when nothing is
-    # cached, rather than erroring out or reporting stale figures.
     orig_mapping = dict(app.PVOUTPUT_MAPPING)
     orig_enable_p1 = app.ENABLE_P1
     orig_elec_cache = app._elec_cache
-    orig_use_raw_daily_yield = app.PVOUTPUT_USE_RAW_DAILY_YIELD
     app.ENABLE_P1 = True
     app._elec_cache = None
     app.PVOUTPUT_MAPPING = {"v1": "daily_generation_wh", "v3": "house_power_w"}
-    # daily_generation_wh's own Postgres-backed baseline lookup is covered separately in
-    # check_daily_generation_wh_corrected() -- pin it to the raw-register path here so this check
-    # stays what it's testing (the electricity-cache degrade) and doesn't also depend on mocking
-    # psycopg.connect.
-    app.PVOUTPUT_USE_RAW_DAILY_YIELD = True
+    previous_level = app.log.level
+    app.log.setLevel(logging.CRITICAL)
     try:
-        params = app.build_pvoutput_params(inverter)
+        params = app.build_pvoutput_params(values)
         if "v3" in params:
-            failures.append(
-                f"  build_pvoutput_params() included v3 (house_power_w needs P1 electricity data) "
-                f"with no cached reading: {params}"
-            )
-        if "v1" not in params:
-            failures.append(f"  build_pvoutput_params() dropped v1 (inverter-only) unexpectedly: {params}")
+            failures.append(f"  build_pvoutput_params() included v3 without electricity data: {params}")
+        if params.get("v1") != 8700:
+            failures.append(f"  build_pvoutput_params() lost v1: {params}")
+        # No daily yield yet (no baseline): v1 is omitted, the upload still goes out with v2.
+        app.PVOUTPUT_MAPPING = {"v1": "daily_generation_wh", "v2": "generation_w"}
+        params = app.build_pvoutput_params({k: v for k, v in values.items() if k != "daily_power_yields"})
+        if "v1" in params or params.get("v2") != 2350:
+            failures.append(f"  build_pvoutput_params() without a daily yield: {params}")
     finally:
         app.PVOUTPUT_MAPPING = orig_mapping
         app.ENABLE_P1 = orig_enable_p1
         app._elec_cache = orig_elec_cache
-        app.PVOUTPUT_USE_RAW_DAILY_YIELD = orig_use_raw_daily_yield
+        app.log.setLevel(previous_level)
 
     if len(failures) == before:
-        print(
-            "  pvoutput metrics: house_power_w/total_house_energy_wh correct; "
-            "degrades to inverter-only without P1 electricity data"
-        )
+        print("  pvoutput metrics: house = grid + battery AC output; degrades without P1 or a daily baseline")
 
 
 def check_daily_generation_wh_corrected(failures):
-    """app._daily_generation_wh_corrected() -- the fix for daily_power_yields periodically failing
-    to reset at local midnight on this inverter (see README's "Solar daily yield" section).
-
-    Covers all four paths: a cache hit never touches Postgres at all (psycopg.connect is
-    monkeypatched to raise if called, so a regression that dropped the cache check would fail
-    loudly rather than just being slower); a cache miss queries get_daily_yield_baseline() and
-    populates the cache for next time; a cache miss with no row at all falls back to the raw
-    register; and PVOUTPUT_USE_RAW_DAILY_YIELD=True bypasses all of the above unconditionally.
-    """
+    """app.daily_yield_kwh(): today's generation from the lifetime total and the last total before
+    local midnight, which is how every daily figure in the stack is computed."""
     before = len(failures)
     today = datetime.now().astimezone().date()
-    orig_baseline = app._daily_yield_baseline
-    orig_use_raw = app.PVOUTPUT_USE_RAW_DAILY_YIELD
-    orig_connect = app.psycopg.connect
+    saved = (app._daily_yield_baseline, app._daily_yield_retry_after, app.psycopg.connect)
 
     def _explode(**kwargs):
         raise AssertionError("psycopg.connect() should not have been called")
 
+    previous_level = app.log.level
+    app.log.setLevel(logging.CRITICAL)
     try:
-        # 1. Cache hit: today's baseline is already cached, so this must use it directly and
-        #    never touch Postgres. Prefers total_power_yields_precise over total_power_yields on
-        #    the "current" side, matching the same preference get_daily_yield_baseline applies to
-        #    the baseline side.
-        app.PVOUTPUT_USE_RAW_DAILY_YIELD = False
-        app._daily_yield_baseline = (today, 27130.0)
+        # 1. Cache hit: never touches Postgres.
+        app._daily_yield_baseline = (today, 27866.5)
+        app._daily_yield_retry_after = 0.0
         app.psycopg.connect = _explode
-        inverter = {
-            "daily_power_yields": 999.9,  # deliberately implausible, to prove this path is unused
-            "total_power_yields": 27135,
-            "total_power_yields_precise": 27134.7,
-        }
-        # (27134.7 - 27130.0) * 1000 = 4700
-        expected = 4700
-        got = app._daily_generation_wh_corrected(inverter)
-        if got != expected:
-            failures.append(f"  daily_generation_wh_corrected() cache hit: expected {expected}, got {got}")
+        got = app.daily_yield_kwh(27875.3)
+        if got != 8.8:
+            failures.append(f"  daily_yield_kwh() cache hit: expected 8.8, got {got}")
 
-        # 2. Cache miss, Postgres has a row: must query get_daily_yield_baseline(), use its
-        #    result, and populate the cache with today's date for next time.
+        # 2. Cache miss: queries, prefers the precise baseline, caches it.
         app._daily_yield_baseline = None
-        canned_row = (27130, 27130.0)
-        app.psycopg.connect = lambda **kwargs: _FakeConnection(fetch_result=canned_row)
-        got = app._daily_generation_wh_corrected(inverter)
-        if got != expected:
-            failures.append(f"  daily_generation_wh_corrected() cache miss (row found): expected {expected}, got {got}")
-        if app._daily_yield_baseline != (today, 27130.0):
-            failures.append(
-                f"  daily_generation_wh_corrected() didn't cache the fetched baseline for today: "
-                f"{app._daily_yield_baseline!r}"
-            )
+        app.psycopg.connect = lambda **kwargs: _FakeConnection(fetch_result=(27866, 27866.5))
+        got = app.daily_yield_kwh(27875.3)
+        if got != 8.8 or app._daily_yield_baseline != (today, 27866.5):
+            failures.append(f"  daily_yield_kwh() cache miss: got {got}, cache {app._daily_yield_baseline!r}")
 
-        # 3. Cache miss, Postgres has no row at all (e.g. a genuine gap in our own polling right
-        #    around some past midnight): must fall back to the raw register rather than dropping
-        #    the upload.
+        # 3. No row before midnight: None, and no new query on the next poll.
         app._daily_yield_baseline = None
         app.psycopg.connect = lambda **kwargs: _FakeConnection(fetch_result=None)
-        expected_fallback = round(inverter["daily_power_yields"] * 1000)
-        got = app._daily_generation_wh_corrected(inverter)
-        if got != expected_fallback:
-            failures.append(
-                f"  daily_generation_wh_corrected() cache miss (no row): expected fallback "
-                f"{expected_fallback}, got {got}"
-            )
-
-        # 4. The escape hatch: must bypass all of the above unconditionally, without even
-        #    checking the cache first.
-        app.PVOUTPUT_USE_RAW_DAILY_YIELD = True
-        app._daily_yield_baseline = None
+        got = app.daily_yield_kwh(27875.3)
         app.psycopg.connect = _explode
-        got = app._daily_generation_wh_corrected(inverter)
-        if got != expected_fallback:
-            failures.append(
-                f"  daily_generation_wh_corrected() PVOUTPUT_USE_RAW_DAILY_YIELD=True: "
-                f"expected {expected_fallback}, got {got}"
-            )
+        again = app.daily_yield_kwh(27875.3)
+        if got is not None or again is not None:
+            failures.append(f"  daily_yield_kwh() without a baseline: expected None twice, got {got}, {again}")
+
+        # 4. Never negative.
+        app._daily_yield_baseline = (today, 27880.0)
+        if app.daily_yield_kwh(27875.3) != 0.0:
+            failures.append("  daily_yield_kwh() went negative below the baseline")
     finally:
-        app._daily_yield_baseline = orig_baseline
-        app.PVOUTPUT_USE_RAW_DAILY_YIELD = orig_use_raw
-        app.psycopg.connect = orig_connect
+        app._daily_yield_baseline, app._daily_yield_retry_after, app.psycopg.connect = saved
+        app.log.setLevel(previous_level)
 
     if len(failures) == before:
-        print(
-            "  daily_generation_wh_corrected: cache hit skips Postgres, cache miss queries and "
-            "caches it, no-row and PVOUTPUT_USE_RAW_DAILY_YIELD both fall back to the raw register"
-        )
+        print("  daily yield: cache hit skips Postgres, cache miss queries and caches, no row gives None "
+              "(held off), never negative")
 
 
 def _monta_charge(i, **over):
@@ -1872,6 +1731,7 @@ def _monta_charge(i, **over):
          "price": 6.17, "cost": 3.53, "currency": {"identifier": "eur", "name": "Euros", "decimals": 2}}
     c.update(over)
     return c
+
 
 
 def check_monta(failures):
@@ -1953,6 +1813,7 @@ def main():
 
     failures = []
     check_modbus_poll(failures)
+    check_battery_is_read_only(failures)
     check_inverter_reconnect_after_broken_pipe(failures)
     check_mqtt_connect(failures)
     check_mqtt_publish_switch(failures)
@@ -1984,7 +1845,7 @@ def main():
         print("\n".join(failures), file=sys.stderr)
         return 1
 
-    print("smoke test passed: modbus, inverter reconnect after broken pipe, mqtt connect, mqtt publish switch, "
+    print("smoke test passed: modbus, battery read-only, battery reconnect after broken pipe, mqtt connect, mqtt publish switch, "
           "postgres write, postgres write retry, clean stop, postgres read, P1 telegram parsing, "
           "P1 relay broadcast, P1 stall reconnect, P1 over HTTP, plug parsing, DSMR timestamps (incl. DST fall-back), "
           "smart-meter source stability, pvoutput metrics, daily generation yield correction, "

@@ -4,12 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-file Python service (`app.py`) that polls a Sungrow inverter over Modbus TCP, reads
-electricity/gas readings directly off the P1 smart-meter telegram stream over the network, and
+A single-file Python service (`app.py`) that polls an Anker SOLIX Solarbank (PV + home battery)
+over Modbus TCP, reads electricity/gas readings directly off the P1 smart-meter telegram (a stream,
+or a P1 dongle's HTTP API), and
 consumes Zigbee2MQTT for per-circuit smart-plug submetering; writes everything to TimescaleDB,
-optionally republishes inverter and smart-meter readings to MQTT (gated by `ENABLE_MQTT_PUBLISH`,
+optionally republishes solar and smart-meter readings to MQTT (gated by `ENABLE_MQTT_PUBLISH`,
 default off), and optionally uploads to PVOutput and Mindergas. Built as a self-maintained
-replacement for the third-party `bohdans/sungather` image. Published to
+replacement for the third-party `bohdans/sungather` image; it read a Sungrow inverter until the
+Solarbank replaced it (that code is in the git history). Published to
 `ghcr.io/puijken/docker-energy-monitor`.
 
 **This repo is public.** Real device names, IPs, and deployment status belong in a gitignored
@@ -44,7 +46,7 @@ docker run --rm -v "$PWD/smoke_test.py:/app/smoke_test.py:ro" energy-monitor:dev
 # finally block. If one passes alone but fails in the suite, suspect leaked state from an earlier
 # check rather than the check itself.
 
-# Run standalone (needs a real or reachable inverter/broker/DB, or edit docker-compose.yml)
+# Run standalone (needs a real or reachable battery/broker/DB, or edit docker-compose.yml)
 docker compose up -d
 docker compose logs -f energy-monitor
 ```
@@ -60,9 +62,9 @@ Everything lives in `app.py` as one process with in-memory shared state — no f
 classes, just module-level globals guarded by `_state_lock` (or their own dedicated lock, see
 `_elec_lock`) and daemon threads started from `main()`:
 
-- **Main thread** — the inverter poll loop (`SCAN_INTERVAL` seconds): connects Modbus, calls
-  `poll_inverter`, updates `latest_values`/`latest_poll_monotonic` under the lock, queues a
-  Postgres write, computes `derived_fields` (power_flow), and publishes to MQTT if
+- **Main thread** — the battery poll loop (`SCAN_INTERVAL` seconds): connects Modbus, calls
+  `poll_battery`, adds `daily_yield_kwh`, updates `latest_values`/`latest_poll_monotonic` under the
+  lock, queues the `solar` and `battery` writes, computes `derived_fields` (power_flow), and publishes to MQTT if
   `ENABLE_MQTT_PUBLISH`. Each sink is wrapped
   in its own `try/except` so a Postgres or MQTT outage can't stop the others.
 - **`pg_writer_loop`** — drains a `queue.Queue` fed by `queue_write()` and performs the actual
@@ -128,15 +130,18 @@ that thread, `_elec_lock` covers `_elec_cache` (the cached electricity reading P
 
 Key structures/functions to know before editing:
 
-- `REGISTERS` — the Modbus register map: address, datatype, scaling per field. Addresses are
-  Sungrow's 1-based protocol numbers; `poll_inverter` does the `-1` for 0-based Modbus reads.
-- `decode_register` — **32-bit values are low-word-first.** A big-endian read of the same register
-  produces plausible-looking wrong numbers, not an error — this is what `smoke_test.py`'s MPPT-sum
-  and AC/DC-ratio assertions exist to catch.
-- `WORK_STATES` — maps `work_state_1` (register 5038) to human states; unmapped codes log as
-  `Unknown (0x....)` rather than being silently dropped.
+- `poll_battery` / `BLOCK_A`, `BLOCK_B` — the Solarbank's register map, read as two input-register
+  blocks plus a few single reads. Wire addresses, no offset. **32-bit values are high-word-first**
+  (`_u32`/`_i32`); a low-word-first decode gives plausible-looking wrong numbers. Some undocumented
+  registers read 0 inside a block and must be read on their own. Returns `(solar, battery)`.
+- `_read` — the only Modbus call path; function codes 3 and 4 only. **Never write to the battery**:
+  10064 (mode), 10071 (setpoint) and 60000–60003 (charge limits) are writable.
+- `SOLAR_SOURCE = "sungrow"` — kept from the replaced inverter, like `P1_SOURCE`: a GROUP BY key
+  downstream; `PV_TOTAL_OFFSET_KWH` continues the lifetime series.
+- `daily_yield_kwh` — today's yield = lifetime total minus the last total before local midnight
+  (cached per day, DB lookup held off on failure).
 - `publish_mqtt` — takes the prefix and an optional field allowlist, so one function serves both
-  topic trees. Called from *two* threads: the poll loop (inverter, `MQTT_TOPIC_PREFIX`) and
+  topic trees. Called from *two* threads: the poll loop (solar, `MQTT_TOPIC_PREFIX`) and
   `_handle_p1_telegram` (electricity, `MQTT_ELEC_TOPIC_PREFIX`, on the same throttle as the
   Postgres write). The latter reaches the client via the module-level `_mqtt_client`, set once by
   `main()`; paho's `publish()` is thread-safe so no lock is involved.
@@ -160,13 +165,12 @@ Key structures/functions to know before editing:
 - `P1_SOURCE` — the `source` column value for smart-meter rows, pinned to `"dsmr"` and asserted in
   `smoke_test.py`. It is a GROUP BY key in the deploying stack's continuous aggregates, so changing
   it splits history rather than continuing it. Read its comment before touching it.
-- `derived_fields` / `_solar_power_for_derived` — compute `power_flow` (solar/grid/house at one
-  instant) from independently-timestamped inverter and P1 electricity readings. A stale inverter
-  poll is resolved from its last known `run_state`, NOT by substituting 0: idle (`IDLE_RUN_STATES`)
-  is a real zero, anything else returns None and the caller omits `solar_w`/`house_w`. It used to
-  always substitute 0, justified by the inverter going offline overnight — it doesn't, it reports
-  `Standby` at 0 W around the clock, so that only ever fired on real poll failures and turned
-  `house_w` negative. A P1 gap likewise omits grid/house rather than guessing.
+- `derived_fields` / `_battery_values_for_derived` — compute `power_flow` (solar/grid/house at one
+  instant) from independently-timestamped battery and P1 readings. **`house_w = grid_w + the unit's
+  AC output` (10208)**, not PV + grid: with a battery, PV + grid counts charging as house use. Never
+  use the unit's own load/grid registers (10010/10012) for this; they come from its CT meter and
+  are only as good as its wiring. A stale battery poll omits `solar_w`/`house_w` rather than
+  substituting 0; a P1 gap likewise omits grid/house.
 - `build_pvoutput_params` / `push_pvoutput` — maps `PVOUTPUT_V1`…`V6` metric names to values;
   validates the `PVOUTPUT_CUMULATIVE_FLAG`/lifetime-metric combination at startup (see README's
   PVOutput mapping section before touching this).
@@ -184,9 +188,9 @@ Key structures/functions to know before editing:
 
 ## Tests
 
-`smoke_test.py` spins up an in-process Modbus TCP server with known register values, polls it
-through the real `poll_inverter`, and asserts decoded values match expected, DC input covers AC
-output, and the two MPPT strings sum to `total_dc_power`. It has grown well past Modbus alone:
+`smoke_test.py` spins up an in-process Modbus TCP server with the Solarbank's register layout,
+polls it through the real `poll_battery`, and asserts every decoded value and that PV covers
+charging plus AC output. It has grown well past Modbus alone:
 MQTT client construction and the `ENABLE_MQTT_PUBLISH` switch (publishing toggles without
 disabling plug ingestion, which shares the same connection), the Postgres write/read paths against
 a fake connection, P1 telegram framing/CRC/OBIS parsing plus the stall-reconnect and DST

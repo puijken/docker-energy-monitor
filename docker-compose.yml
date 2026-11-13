@@ -3,22 +3,24 @@ services:
     image: ghcr.io/puijken/docker-energy-monitor:latest
     environment:
       - TZ=Europe/Amsterdam
-      # Inverter / dongle address on your network
-      - INVERTER_HOST=192.168.1.50
-      - INVERTER_PORT=502
+      # The Anker SOLIX Solarbank's address on your network (Modbus TCP switched on in the Anker app)
+      - BATTERY_HOST=192.168.1.50
+      - BATTERY_PORT=502
+      # Lifetime kWh of an inverter this unit replaced, to continue its series; 0 otherwise
+      - PV_TOTAL_OFFSET_KWH=0
       - SCAN_INTERVAL=15
       - POSTGRES_HOST=timescaledb
       - POSTGRES_DB=energy
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      # Broker used to (optionally) publish inverter/electricity readings and, if ENABLE_PLUGS is
+      # Broker used to (optionally) publish solar/electricity readings and, if ENABLE_PLUGS is
       # set, to consume Zigbee2MQTT. ENABLE_MQTT_PUBLISH defaults to false, so it's set explicitly
       # here -- otherwise MQTT_HOST below configures a broker connection that's never opened.
       - MQTT_HOST=192.168.1.10
       - MQTT_USERNAME=${MQTT_USERNAME}
       - MQTT_PASSWORD=${MQTT_PASSWORD}
       - ENABLE_MQTT_PUBLISH=true
-      # Two independent topic trees, both gated by ENABLE_MQTT_PUBLISH above: inverter readings
+      # Two independent topic trees, both gated by ENABLE_MQTT_PUBLISH above: solar readings
       # under the first, smart-meter electricity under the second (needs ENABLE_P1 below).
       # Separate so a subscriber can take either side without filtering the other out.
       - MQTT_TOPIC_PREFIX=energy/solar

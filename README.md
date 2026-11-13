@@ -1,21 +1,24 @@
 # Energy Monitor
 
-Collects whole-house energy data into one TimescaleDB (Postgres): solar generation read from a
-Sungrow inverter over Modbus TCP, and electricity/gas consumption read directly off the P1 smart
-meter's telegram stream over the network. Optionally re-publishes solar values to MQTT, and uploads
+Collects whole-house energy data into one TimescaleDB (Postgres): solar generation and the home
+battery read from an Anker SOLIX Solarbank (Max) over Modbus TCP, and electricity/gas consumption
+read directly off the P1 smart meter's telegram (from a stream, or from a P1 dongle's HTTP API). Optionally re-publishes solar values to MQTT, and uploads
 to PVOutput (every few minutes) and Mindergas (once daily). Built as a self-maintained replacement
-for the third-party `bohdans/sungather` image.
+for the third-party `bohdans/sungather` image; it read a Sungrow string inverter until that was
+replaced by the Solarbank (the Sungrow code is in the git history).
 
 ## Features
 
-- Polls the inverter every `SCAN_INTERVAL` seconds over Modbus TCP (function code 4 / input
-  registers): generation power, daily and lifetime yield, DC/MPPT voltage & current, phase voltage,
-  internal temperature.
+- Polls the Solarbank every `SCAN_INTERVAL` seconds over Modbus TCP (read-only, function codes 3
+  and 4): PV power and lifetime yield, battery power and state of charge, the unit's AC output,
+  charge/discharge counters and settings. See [Modbus register map](#modbus-register-map).
 - Connects to a plain-TCP relay of the meter's P1 port and parses DSMR telegrams itself
   (CRC-verified) for smart-meter electricity and gas readings, and writes those to the same
   database too — so one place holds generation *and* consumption, with no other project's exporter
   in the path.
-- Writes every reading to TimescaleDB (`solar` table, `source=sungrow`; smart-meter data under
+- Writes every reading to TimescaleDB (PV under `solar` with `source=sungrow`, kept from the
+  previous inverter so the series continues, see [Modbus register map](#modbus-register-map);
+  the battery under `battery` with `source=anker`; smart-meter data under
   `electricity` / `gas_positions` with `source=dsmr`). That `source` value names the *meter*, not
   the program reading it, so it stays put across ingestion-path changes — it is a grouping key in
   downstream continuous aggregates, and changing it starts a parallel series instead of continuing
@@ -25,7 +28,7 @@ for the third-party `bohdans/sungather` image.
   codes are mapped through a fixed allowlist and anything unlisted is dropped at parse time, so a
   new smart-meter field does need one.
 - Optionally re-publishes readings to MQTT, one retained topic per field, under two separate
-  prefixes: inverter data under `MQTT_TOPIC_PREFIX` and smart-meter electricity under
+  prefixes: solar data under `MQTT_TOPIC_PREFIX` and smart-meter electricity under
   `MQTT_ELEC_TOPIC_PREFIX`, so a subscriber can take either side alone. Both are gated by the one
   `ENABLE_MQTT_PUBLISH` switch (default off). Outbound only — nothing here reads it back, and
   Postgres is written either way.
@@ -58,16 +61,18 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | Variable | Default | Description |
 |---|---|---|
 | `LOG_LEVEL` | `WARNING` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` (case-insensitive). See [Log levels](#log-levels). |
-| `INVERTER_HOST` | *required* | Inverter/dongle IP address |
-| `INVERTER_PORT` | `502` | Modbus TCP port |
-| `INVERTER_SLAVE_ID` | `1` | Modbus slave/unit ID |
-| `SCAN_INTERVAL` | `15` | Seconds between inverter polls |
+| `BATTERY_HOST` | *required* | Solarbank IP address (Modbus TCP switched on in the Anker app) |
+| `BATTERY_PORT` | `502` | Modbus TCP port |
+| `BATTERY_UNIT_ID` | `1` | Modbus unit ID |
+| `BATTERY_TABLE` | `battery` | Table for the battery rows |
+| `PV_TOTAL_OFFSET_KWH` | `0` | Added to the unit's lifetime PV counter; set to a previous inverter's final total to continue its series |
+| `SCAN_INTERVAL` | `15` | Seconds between battery polls |
 | `POSTGRES_HOST` | *required* | TimescaleDB/Postgres hostname, e.g. `timescaledb` |
 | `POSTGRES_PORT` | `5432` | Postgres port |
 | `POSTGRES_DB` | `energy` | Database name |
 | `POSTGRES_USER` | *required* | Database user |
 | `POSTGRES_PASSWORD` | *required* | Database password |
-| `POSTGRES_TABLE` | `solar` | Table name written to for inverter readings |
+| `POSTGRES_TABLE` | `solar` | Table name written to for the PV readings |
 | `WRITE_QUEUE_SIZE` | `2000` | Max points buffered for the Postgres writer thread. While the database is unreachable the writer holds its current point and retries (1 s → 30 s backoff), so this queue is what bridges the outage; at a few points per second the default covers roughly half an hour. Past that the oldest queued point is dropped first rather than growing without bound. A point the database *rejects* (bad data, unknown column) is logged and dropped at once, so it can't block the ones behind it. |
 | `SHUTDOWN_DRAIN_TIMEOUT` | `5` | Seconds a requested stop (`SIGTERM`/`SIGINT`, i.e. `docker stop`) waits for queued points to reach Postgres before exiting anyway. Normally the queue is all but empty and the container stops in well under a second. Keep it below the stop grace period (`docker stop` allows 10 s by default); anything still unwritten when it runs out is logged as a warning and lost, which only happens when the database is unreachable at that moment. |
 | `MQTT_HOST` | *required if MQTT is used* | Broker hostname/IP. Only required when `ENABLE_MQTT_PUBLISH` or `ENABLE_PLUGS` is on; with both off the container never connects to a broker at all. |
@@ -75,10 +80,10 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `MQTT_USERNAME` | *(none)* | MQTT username, if required |
 | `MQTT_PASSWORD` | *(none)* | MQTT password, if required |
 | `MQTT_WARN_AFTER` | `60` | Seconds without a broker connection before warning it looks unreachable; repeats every interval while still disconnected |
-| `ENABLE_MQTT_PUBLISH` | `false` | Re-publish each inverter reading to MQTT, one retained topic per field. Purely an outbound copy — Postgres is written either way and nothing here reads it back. **Changed from `true` to `false` on 2026-08-14**: if you are upgrading and something subscribes to these topics, set this to `true` or it goes quiet. Does **not** affect plug ingestion, which shares the same connection. |
-| `MQTT_TOPIC_PREFIX` | `energy/solar` | Topic prefix for **inverter** readings; one sub-topic per field. |
+| `ENABLE_MQTT_PUBLISH` | `false` | Re-publish each solar reading to MQTT, one retained topic per field. Purely an outbound copy — Postgres is written either way and nothing here reads it back. **Changed from `true` to `false` on 2026-08-14**: if you are upgrading and something subscribes to these topics, set this to `true` or it goes quiet. Does **not** affect plug ingestion, which shares the same connection. |
+| `MQTT_TOPIC_PREFIX` | `energy/solar` | Topic prefix for **solar** readings; one sub-topic per field. |
 | `MQTT_ELEC_TOPIC_PREFIX` | `energy/electricity` | Topic prefix for **smart-meter electricity** readings, published at `P1_MIN_INTERVAL` cadence. Only produces anything when `ENABLE_P1` is on. Gas and plug data are not published. |
-| `MQTT_PUBLISH_FIELDS` | *(all)* | Comma-separated **inverter** field names to publish, e.g. `total_active_power,run_state`. Leave unset to publish everything. Applies to the inverter topic tree only, not `MQTT_ELEC_TOPIC_PREFIX`. These are the field names as published, which are not quite the register names: use `run_state`, not the raw `work_state_1` it is decoded from, and `total_power_yields_precise` is available even though it is not part of the main register block. Unrecognised names are warned about at startup. |
+| `MQTT_PUBLISH_FIELDS` | *(all)* | Comma-separated **solar** field names to publish, e.g. `total_active_power,daily_power_yields`. Leave unset to publish everything. Applies to the inverter topic tree only, not `MQTT_ELEC_TOPIC_PREFIX`. These are the field names as published, which are not quite the register names: use `run_state`, not the raw `work_state_1` it is decoded from, and `total_power_yields_precise` is available even though it is not part of the main register block. Unrecognised names are warned about at startup. |
 | `ENABLE_P1` | `false` | Connect to a P1 telegram relay for smart-meter data. See [Smart-meter data](#smart-meter-data). |
 | `P1_HOST` | *required if `ENABLE_P1=true` and `P1_URL` is unset* | Host/IP of the P1 telegram relay |
 | `P1_PORT` | `2001` | Port of the P1 telegram relay |
@@ -93,9 +98,9 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `ENABLE_P1_RELAY` | `false` | Re-serve the P1 stream to downstream TCP clients (e.g. DSMR-reader). **Never share ser2net itself between two long-lived clients — use this instead.** See [Sharing the P1 port](#sharing-the-p1-port-with-something-else-that-also-reads-it). |
 | `P1_RELAY_BIND` / `P1_RELAY_PORT` | `0.0.0.0` / `2000` | Interface/port the relay listens on |
 | `P1_RELAY_CLIENT_TIMEOUT` | `5` | Seconds a send to a downstream relay client may block before it's dropped as dead |
-| `ENABLE_DERIVED` | `true` | Write `power_flow` (solar/grid/house at one instant), combining the latest cached inverter and P1 electricity readings whenever either updates |
+| `ENABLE_DERIVED` | `true` | Write `power_flow` (solar/grid/house at one instant), combining the latest cached battery and P1 electricity readings whenever either updates |
 | `DERIVED_TABLE` | `power_flow` | Table written to |
-| `SOLAR_STALE_AFTER` | `120` | Seconds after which an inverter poll is too old to reuse for `power_flow`. What happens past it depends on the inverter's last known `run_state` — see [What a stale inverter poll means](#what-a-stale-inverter-poll-means). |
+| `SOLAR_STALE_AFTER` | `120` | Seconds after which a battery poll is too old to reuse for `power_flow`; past it the solar and house terms are omitted — see [What a stale battery poll means](#what-a-stale-battery-poll-means). |
 | `ENABLE_PLUGS` | `false` | Subscribe to configured Zigbee2MQTT smart-plug topics for per-circuit submetering. See [Smart plugs](#smart-plugs-zigbee2mqtt). |
 | `PLUG_TOPICS` | *(none)* | Comma-separated `topic=label` pairs, e.g. `zigbee2mqtt/Fridge plug=fridge,zigbee2mqtt/Office plug=office`. The label becomes the `source` column value. |
 | `PLUG_TABLE` | `smart_plugs` | Table written to |
@@ -143,24 +148,36 @@ Change it with a redeploy (`docker compose up -d energy-monitor` after editing t
 
 ## Modbus register map
 
-Targets the **Sungrow SG5.0RS** (`device_type_code` `0x2606`, nominal 5.0 kW) — a single-phase
-residential string inverter, so the hybrid-only (SH-series) register blocks don't apply. Register
-addresses, datatypes and scaling are Sungrow's own published Modbus protocol definition as encoded
-in [bohdan-s/SungrowClient](https://github.com/bohdan-s/SungrowClient) — referenced for
-interoperability, not vendored code. See `REGISTERS` in `app.py` for the exact addresses.
+Targets the **Anker SOLIX Solarbank Max** (model `AE111`), a hybrid unit with its own MPPT inputs
+and a battery. The documented registers come from the config in Anker's Home Assistant integration
+([anker-charging/ha-anker-solix-official](https://github.com/anker-charging/ha-anker-solix-official))
+for this model; a few undocumented ones were identified against the device and are commented as
+such in `poll_battery()`. Facts the reads rely on, all verified on the device:
 
-Addresses there are 1-based protocol register numbers; Modbus reads are 0-based, hence the `-1`
-in `poll_inverter`. All registers are read in a single input-register (function code 4) request.
+- **32-bit values are big-endian, high word first.** The reverse of many inverters; a low-word-first
+  decode gives plausible-looking wrong numbers for small values.
+- Addresses are wire addresses (no 1-based offset). Unit id 1; any id other than 0 or 1 gets no
+  answer at all, so a wrong id is a timeout, not an exception.
+- A read must start on the first word of a value. Inside a block read the firmware returns 0 for
+  some undocumented registers, so those (10254, 10156) are read on their own.
+- **Read-only.** 10064 (operating mode), 10071 (power setpoint) and 60000–60003 (charge limits) are
+  writable; `_read()` only issues function codes 3 and 4.
 
-`run_state` is decoded from the real `work_state_1` register (address 5038, outside the main block
-but still within one Modbus read) via `WORK_STATES` in `app.py` — `Run`, `Stop`, `Standby`, `Fault`,
-etc. An earlier assumption that this inverter family exposed no run/system-state register (that
-block being hybrid-only in Sungrow's protocol) turned out to be wrong; it was derived from
-`total_active_power > 0` instead until this was corrected. An unmapped code is logged as
-`Unknown (0x....)` rather than silently dropped, so a new one shows up rather than going missing.
+| Field | Register | Notes |
+|---|---|---|
+| `solar.total_active_power` | 10002 + 10004 | PV and third-party PV power, W |
+| `solar.total_power_yields` | 10018 (0.1 kWh) + `PV_TOTAL_OFFSET_KWH` | Lifetime PV, kWh |
+| `solar.daily_power_yields` | derived | Lifetime total minus the last one before local midnight |
+| `battery.battery_power` | 10008 | W, positive = discharging |
+| `battery.ac_output_power` | 10208 | W the unit delivers into the house |
+| `battery.load_power`, `grid_power` | 10010, 10012 | The unit's view from its own CT meter; only as good as that meter's wiring. Not used in any calculation |
+| `battery.soc` | 10014 | % |
+| `battery.charge/discharge_energy_total` | 10262, 10264 (0.1 kWh) | At the cells; discharge includes standby drain |
 
-Values were validated against the real inverter: MPPT1 + MPPT2 DC power sums to `total_dc_power`,
-and `total_active_power` (AC) sits just below it with a realistic conversion loss.
+The PV rows keep `source=sungrow` from the inverter the unit replaced, for the same reason the
+smart-meter rows keep `dsmr`: `source` is a grouping key in the downstream continuous aggregates,
+and the daily yield is computed there as the difference of each day's highest lifetime total. With
+`PV_TOTAL_OFFSET_KWH` set to the old inverter's final total, the lifetime series simply continues.
 
 ## Smart-meter data
 
@@ -321,31 +338,28 @@ each using the other side's latest cached value. During the day, when both sides
 few seconds, this doubles `power_flow`'s write rate — harmless at TimescaleDB's scale, and still
 just one row per instant either trigger fires.
 
-### What a stale inverter poll means
+### What a stale battery poll means
 
-On the P1 side the inverter's contribution comes from `_solar_power_for_derived()`, and a poll older
-than `SOLAR_STALE_AFTER` is genuinely ambiguous: it can mean the inverter stopped producing, or that
-contact was lost with one that is producing fine. Those call for opposite answers.
+On the P1 side the battery's contribution comes from `_battery_values_for_derived()`. The unit
+answers around the clock (0 W PV at night is a real reading), so a poll older than
+`SOLAR_STALE_AFTER` means contact was lost, and the PV and house terms are unknown:
 
-This used to always answer 0 W, on the grounds that a stale poll means "asleep, not producing". That
-reasoning assumed the inverter drops off the network when it stops generating. If yours does not —
-this one stays reachable around the clock and reports `Standby` at exactly 0 W all night — then
-nights never relied on the substitution at all, because that 0 W is real data arriving through the
-normal path. The substitution then only ever fired on a genuine poll failure, which is precisely
-when 0 W is wrong: during a daytime dropout it reports a producing array as idle, and since
-`house = solar + import − export`, an exporting house computes as **negative** consumption.
+| Last poll | `solar_w` | `house_w` | `grid_w` |
+|---|---|---|---|
+| fresh | real value | `grid_w` + the unit's AC output | from the meter |
+| stale | *omitted* | *omitted* | from the meter |
 
-Resolved from the inverter's own last-known `run_state` instead of guessing:
+Omitting matches what `derived_fields()` does for a P1 outage: a gap in Grafana rather than a
+plausible-looking zero.
 
-| Last poll | Last known state | `solar_w` | `house_w` | `grid_w` |
-|---|---|---|---|---|
-| fresh | anything | real value | computed | from the meter |
-| stale | idle (`IDLE_RUN_STATES`) | `0` — a real zero | computed | from the meter |
-| stale | producing, or unmapped | *omitted* | *omitted* | from the meter |
+### House use with a battery
 
-Omitting matches what `derived_fields()` already does for a P1 outage: a gap in Grafana rather than
-a plausible-looking zero. `grid_w` comes straight off the meter, so it stays continuous regardless
-of what the inverter is doing.
+`house_w = grid_w + battery_ac_w`, where `battery_ac_w` is the unit's AC output. Before the battery
+it was `solar + import − export`; with the battery between the panels and the house, part of the
+generation goes into the cells and comes out hours later, so PV + grid would count charging as house
+use. The panels reach the house only through the unit, so its AC output is everything the house gets
+that isn't from the grid. `battery_ac_w` and `battery_w` (power at the cells) are stored in the
+row's `extra` so the formula can be checked afterwards.
 
 ## Smart plugs (Zigbee2MQTT)
 
@@ -367,32 +381,29 @@ Each PVOutput parameter is assigned a **metric** by name via `PVOUTPUT_V1`…`PV
 are already expressed in the unit PVOutput expects, so there is no scaling or formula syntax to
 get wrong. Leave a variable unset and that parameter simply isn't uploaded.
 
-The defaults reproduce exactly what the previous SunGather setup sent:
+The defaults:
 
 ```yaml
 - PVOUTPUT_V1=daily_generation_wh    # Energy Generation  (Wh)
 - PVOUTPUT_V2=generation_w           # Power Generation   (W)
-- PVOUTPUT_V6=inverter_voltage_v     # Voltage            (V)
-# V3 (Energy Consumption), V4 (Power Consumption) and V5 (Temperature) unset
+# V3 (Energy Consumption), V4 (Power Consumption), V5 (Temperature) and V6 (Voltage) unset.
+# grid_voltage_v is the usual V6; it needs ENABLE_P1.
 ```
 
 ### Available metrics
 
 | Metric | Unit | Source | Notes |
 |---|---|---|---|
-| `daily_generation_wh` | Wh | inverter | Day total, resets at midnight |
-| `total_generation_wh` | Wh | inverter | Lifetime counter |
-| `generation_w` | W | inverter | Current AC output |
-| `dc_power_w` | W | inverter | Combined MPPT DC input |
-| `inverter_voltage_v` | V | inverter | Grid voltage as the inverter measures it |
-| `inverter_temp_c` | °C | inverter | **Heatsink**, not ambient (~50 °C running) — mapping this to `v5` will skew PVOutput's insolation figures, which is why the old setup left it off |
+| `daily_generation_wh` | Wh | battery | Day total: lifetime total minus the last one before midnight. Omitted until a baseline exists |
+| `total_generation_wh` | Wh | battery | Lifetime counter (including `PV_TOTAL_OFFSET_KWH`) |
+| `generation_w` | W | battery | Current PV power |
+| `battery_soc` | % | battery | State of charge |
 | `grid_import_w` | W | meter | Currently drawn from the grid |
 | `grid_export_w` | W | meter | Currently fed back |
 | `grid_voltage_v` | V | meter | Voltage as the smart meter measures it |
 | `total_import_wh` | Wh | meter | Lifetime, both tariffs summed |
 | `total_export_wh` | Wh | meter | Lifetime, both tariffs summed |
-| `house_power_w` | W | derived | `generation + import − export` — what the house actually uses |
-| `total_house_energy_wh` | Wh | derived | Lifetime equivalent of the above |
+| `house_power_w` | W | derived | `import − export + battery AC output` — what the house actually uses |
 
 There's no day-total equivalent of `house_power_w`/`grid_import_w` (a `daily_import_wh` or
 similar) — the raw P1 telegram carries no running-total-since-midnight field, only cumulative
@@ -403,23 +414,18 @@ Metrics sourced from the **meter** or **derived** from it read the cached P1 ele
 Postgres writes are failing.
 
 If no electricity reading has arrived yet, or the cached one is older than `P1_MAX_DATA_AGE`, the
-parameters needing it are dropped and the upload still goes out with the inverter-only values. A
+parameters needing it are dropped and the upload still goes out with the battery-only values. A
 stalled P1 connection therefore degrades the upload rather than losing it or reporting figures
 from hours ago.
 
 ### Reporting consumption as well as generation
 
-To have PVOutput show household consumption, not just generation:
-
 ```yaml
-- PVOUTPUT_V1=total_generation_wh
-- PVOUTPUT_V3=total_house_energy_wh
 - PVOUTPUT_V4=house_power_w
-- PVOUTPUT_CUMULATIVE_FLAG=1
 ```
 
-Lifetime metrics are used for `v1`/`v3` here on purpose: lifetime counters never reset, so there's
-no day-boundary or timezone ambiguity about which day a figure belongs to.
+There is no lifetime house-energy metric any more: it would need a lifetime counter of the unit's
+AC output, and none has been identified. PVOutput derives consumption energy from `v4` itself.
 
 `PVOUTPUT_CUMULATIVE_FLAG` (PVOutput's `c1`) **must agree** with whether `v1`/`v3` are lifetime
 counters — `1` = both lifetime, `2` = only `v1`, `3` = only `v3`, omitted = both are day totals. A
@@ -481,12 +487,13 @@ naive value as the session's local time, so passing naive local time here would 
 ## Tests
 
 `smoke_test.py` exercises every external dependency this container talks to — Modbus, MQTT and
-Postgres — without a real inverter, broker or database. It started out covering only the register
+Postgres — without a real battery, broker or database. It started out covering only the register
 decode path and has grown alongside the features above:
 
-- **Modbus decode**: an in-process Modbus server serves known register values, polled through
-  `app.poll_inverter`; asserts the decoded results, that DC input covers AC output, and that the
-  two MPPT strings sum to `total_dc_power` — catching word-order and scaling regressions.
+- **Modbus decode**: an in-process Modbus server serves the Solarbank's registers in its own layout
+  (high word first, negative values, registers read on their own, a holding register), polled
+  through `app.poll_battery`; asserts every decoded value and that PV covers charging plus AC
+  output — catching word-order and scaling regressions. `_read()` must refuse write function codes.
 - **MQTT client + the `ENABLE_MQTT_PUBLISH` switch**: `app.mqtt_connect()` still returns a working
   client, and publishing toggles on/off correctly without disabling plug ingestion, which shares
   the same broker connection.
@@ -511,7 +518,9 @@ decode path and has grown alongside the features above:
 - **Smart plugs**: real captured Zigbee2MQTT payloads from both plug models on this network (Aqara,
   Tuya), checking that only the common fields are kept and per-model extras are dropped.
 - **PVOutput metrics**: the `app.METRICS` formulas, and that a missing/stale electricity reading
-  degrades the upload to inverter-only values rather than losing it.
+  degrades the upload to battery-only values rather than losing it; `house_w = grid + battery AC
+  output` in `power_flow`; a stale battery poll omitted rather than zeroed; the daily yield from the
+  lifetime total and the midnight baseline.
 - **Smart-meter `source` stability**: `P1_SOURCE` stays pinned to `"dsmr"`, since changing it splits
   every downstream continuous aggregate at the cutover instant.
 

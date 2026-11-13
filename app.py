@@ -70,10 +70,20 @@ def env_int(name, default):
         sys.exit(1)
 
 
-INVERTER_HOST = env("INVERTER_HOST", required=True)
-INVERTER_PORT = env_int("INVERTER_PORT", 502)
-INVERTER_SLAVE_ID = env_int("INVERTER_SLAVE_ID", 1)
+# The solar side is an Anker SOLIX Solarbank (Max): a hybrid unit with its own MPPT inputs and a
+# battery, read over Modbus TCP. The panels, the battery and the unit's AC output all come from it.
+BATTERY_HOST = env("BATTERY_HOST", required=True)
+BATTERY_PORT = env_int("BATTERY_PORT", 502)
+# Unit id 1. Id 0 answers too; any other id gets no answer at all, so a wrong id shows up as a
+# timeout, not as a Modbus exception.
+BATTERY_UNIT_ID = env_int("BATTERY_UNIT_ID", 1)
 SCAN_INTERVAL = env_int("SCAN_INTERVAL", 15)
+BATTERY_TABLE = env("BATTERY_TABLE", "battery")
+# Added to the unit's own lifetime PV counter (register 10018) to give total_power_yields. Set it to
+# the previous inverter's final lifetime total when the unit replaces one, so the lifetime series --
+# and everything that diffs it per day, PVOutput's lifetime figure included -- continues instead of
+# restarting at 0. 0 for a system that started with this unit.
+PV_TOTAL_OFFSET_KWH = float(env("PV_TOTAL_OFFSET_KWH", "0"))
 
 POSTGRES_HOST = env("POSTGRES_HOST", required=True)
 POSTGRES_PORT = env_int("POSTGRES_PORT", 5432)
@@ -94,7 +104,7 @@ MQTT_TOPIC_PREFIX = env("MQTT_TOPIC_PREFIX", "energy/solar").rstrip("/")
 # the other and neither has to filter by field name. Same ENABLE_MQTT_PUBLISH switch governs both;
 # this one only produces anything when ENABLE_P1 is on, since that is where the readings come from.
 MQTT_ELEC_TOPIC_PREFIX = env("MQTT_ELEC_TOPIC_PREFIX", "energy/electricity").rstrip("/")
-# Re-publish each inverter reading to MQTT, one retained topic per field under MQTT_TOPIC_PREFIX.
+# Re-publish each solar reading to MQTT, one retained topic per field under MQTT_TOPIC_PREFIX.
 # Purely an outbound copy for other systems to consume -- nothing in this container reads it back,
 # and Postgres is written either way, so turning it off loses no data here.
 #
@@ -114,7 +124,7 @@ MQTT_ELEC_TOPIC_PREFIX = env("MQTT_ELEC_TOPIC_PREFIX", "energy/electricity").rst
 ENABLE_MQTT_PUBLISH = env_bool("ENABLE_MQTT_PUBLISH", False)
 # How long to allow for the broker connection before warning, then re-warning, about it.
 MQTT_WARN_AFTER = env_int("MQTT_WARN_AFTER", 60)
-# Comma-separated register names to publish (e.g. "total_active_power,run_state"). Empty/unset
+# Comma-separated register names to publish (e.g. "total_active_power,daily_power_yields"). Empty/unset
 # publishes everything.
 MQTT_PUBLISH_FIELDS = {f.strip() for f in env("MQTT_PUBLISH_FIELDS", "").split(",") if f.strip()}
 
@@ -237,20 +247,10 @@ PLUG_MIN_INTERVAL = env_int("PLUG_MIN_INTERVAL", 5)
 # per SCAN_INTERVAL.
 ENABLE_DERIVED = env_bool("ENABLE_DERIVED", True)
 DERIVED_TABLE = env("DERIVED_TABLE", "power_flow")
-# How long a solar poll stays "current" for power_flow purposes -- comfortably above SCAN_INTERVAL
-# so a single missed poll doesn't trip it. What happens *past* it is decided by IDLE_RUN_STATES
-# below, not by a fixed substitution; see _solar_power_for_derived.
+# How long a battery poll stays "current" for power_flow purposes -- comfortably above
+# SCAN_INTERVAL so a single missed poll doesn't trip it. Past it, the solar and battery terms are
+# unknown and power_flow omits them; see _battery_values_for_derived.
 SOLAR_STALE_AFTER = env_int("SOLAR_STALE_AFTER", 120)
-# Run states in which the inverter is genuinely idle rather than unreachable, used to interpret a
-# stale poll. Confirmed against 30 days of real polling on this model: every state listed here
-# reports exactly 0 W (max, not merely mean), while every "*Run*" state averages ~2 kW.
-#
-# This distinction is the whole point. A stale poll is ambiguous on its own -- it can mean the
-# inverter stopped producing, or that we simply lost contact with one that is producing fine -- and
-# those call for opposite answers. Anything not listed here, including an unmapped state code, is
-# treated as "was producing, or unknown", which is deliberately the side that omits rather than
-# guesses.
-IDLE_RUN_STATES = {"Stop", "Key Stop", "Emergency Stop", "Standby", "Initial Standby", "Fault"}
 
 
 def parse_plug_topics(raw):
@@ -299,15 +299,7 @@ PVOUTPUT_CUMULATIVE_FLAG = env_int("PVOUTPUT_CUMULATIVE_FLAG", 0)
 # Don't upload a reading older than this -- otherwise a stalled Modbus connection would keep
 # re-posting the last known value stamped with the current time.
 PVOUTPUT_MAX_DATA_AGE = env_int("PVOUTPUT_MAX_DATA_AGE", 600)
-# daily_power_yields (register 5003, "yield so far today") periodically fails to reset to 0 at
-# local midnight on this inverter -- confirmed against a year of iSolarCloud exports, see the
-# README's "Solar daily yield" section -- and when that happens it silently inflates every v1
-# upload for the rest of the stuck streak (PVOutput eventually rejects the more extreme ones, e.g.
-# "too high for 10:00" or "Moon powered", but plenty of smaller-margin ones go through unrejected).
-# The dashboards were already fixed by diffing the lifetime counter (total_power_yields) instead;
-# this makes the live PVOutput push do the same rather than trusting the raw register. Escape
-# hatch only, not a real setting to reach for -- see _daily_generation_wh_corrected below.
-PVOUTPUT_USE_RAW_DAILY_YIELD = env_bool("PVOUTPUT_USE_RAW_DAILY_YIELD", False)
+
 
 ENABLE_MINDERGAS = env_bool("ENABLE_MINDERGAS", False)
 MINDERGAS_API_KEY = env("MINDERGAS_API_KEY")
@@ -361,105 +353,55 @@ MONTA_VAT_RATE = float(env("MONTA_VAT_RATE", str(stroohm_monta_api.DEFAULT_VAT_R
 MONTA_COLUMNS = ["id", "human_readable_id", "state", "charge_point_id", "started_at", "stopped_at",
                  "energy_kwh", "price_incl_vat", "price_excl_vat", "currency", "raw"]
 
-# Modbus register map for the Sungrow SG5.0RS (device_type_code 0x2606, nominal 5.0 kW) -- a
-# single-phase residential string inverter with no battery or meter, so the hybrid-only
-# (SH-series) register blocks don't apply.
-#
-# Addresses and scaling are Sungrow's own published Modbus protocol definition, as encoded in
-# github.com/bohdan-s/SungrowClient (registers-sungrow.yaml) -- referenced for interoperability,
-# not vendored code. Addresses are 1-based protocol register numbers; Modbus reads are 0-based,
-# hence the -1 in poll_inverter. All of these live in the input-register space (function code 4).
-REGISTERS = {
-    "daily_power_yields": (5003, "U16", 0.1, "kWh"),
-    # Whole kWh: register 5004 carries no scaling factor. Verified against the inverter -- 26261
-    # kWh over total_running_time 18169 h is 1.45 kW average while generating, right for a 5 kWp
-    # array. The 0.1-scaled twin at 5144 (FINE_TOTAL_YIELD_REGISTER below) sits far enough outside
-    # this block that including it here would push a single Modbus read past the 125-register
-    # protocol limit, so it's polled separately instead -- see poll_inverter.
-    "total_power_yields": (5004, "U32", None, "kWh"),
-    "total_running_time": (5006, "U32", None, "h"),
-    "internal_temperature": (5008, "S16", 0.1, "C"),
-    # Apparent power alongside active power gives power factor as a query-time division.
-    # Read 3292 VA against 3300 W active, so this model reports it essentially unity.
-    "total_apparent_power": (5009, "U32", None, "VA"),
-    "mppt_1_voltage": (5011, "U16", 0.1, "V"),
-    "mppt_1_current": (5012, "U16", 0.1, "A"),
-    "mppt_2_voltage": (5013, "U16", 0.1, "V"),
-    "mppt_2_current": (5014, "U16", 0.1, "A"),
-    "total_dc_power": (5017, "U32", None, "W"),
-    "phase_a_voltage": (5019, "U16", 0.1, "V"),
-    "phase_a_current": (5022, "S16", 0.1, "A"),
-    "total_active_power": (5031, "U32", None, "W"),
-    # Sits outside the block the other registers fall in, so this widens the single Modbus read
-    # by a few registers rather than costing a second round trip. Decoded into run_state below,
-    # not stored under this name -- see WORK_STATES.
-    "work_state_1": (5038, "U16", None, None),
-}
-# Deliberately absent: installed_pv_power (5016) reads 0 on this unit rather than the array
-# size, so dashboards carry the 6.32 kWp figure as a constant instead. phase_b/c_voltage
-# (5020/5021) and mppt_3 (5015/5016) read 0 too -- this is a single-phase, two-string model.
-# Every register above already falls inside the one block poll_inverter reads, so none of
-# them costs an extra Modbus round trip.
+# The Solarbank's Modbus map. Documented registers come from the config in Anker's own Home
+# Assistant integration (anker-charging/ha-anker-solix-official) for this model; the rest were
+# identified against the device and are marked as such. Facts the reads rely on, all verified:
+#   - 32-bit values are big-endian, HIGH word first (the reverse of many inverters).
+#   - Addresses are wire addresses; there is no 1-based offset.
+#   - A read must start on the first word of a value; asking for the second word alone returns
+#     exception 2, the same as an unmapped address.
+#   - Inside a block read the firmware returns 0 for some undocumented registers (10254, 10156),
+#     so those are read on their own.
+#   - Function codes 3 and 4 return the same data.
+# This code only ever reads. Register 10064 is the operating mode, 10071 the power setpoint and
+# 60000-60003 the charge limits, all writable: nothing here may write to them.
+BLOCK_A = (10000, 51)   # status, powers, SOC, PV total, power limits
+BLOCK_B = (10199, 67)   # AC side, AC output, charge/discharge totals
+MODE_REGISTER = 10064   # holding register
+CELL_POWER_REGISTER = 10254
+TEMPERATURE_REGISTER = 10156
+SOC_LIMIT_REGISTERS = (60000, 4)
 
-# 0.1 kWh-scaled twin of total_power_yields (register 5004), confirmed live against the inverter
-# (26450.8 kWh here vs 26450 unscaled). Read as its own small Modbus block rather than folded into
-# REGISTERS/the main scan: 5144 sits far enough past the 5003-5038 block that including it would
-# push SCAN_COUNT to 143 registers, over the 125-register limit a single Modbus read PDU allows.
-#
-# Exists to fix a real problem: dashboard panels that compute a single day's (or the live "so
-# far today") generation as max(total_power_yields) - min(total_power_yields) over that period
-# inherit total_power_yields' whole-kWh quantization, which shows up as visible 1 kWh jumps when
-# the day's total is still small (see dashboard_energy's README). This field isn't in REGISTERS,
-# so it isn't a fixed column on the `solar` table -- it lands in `extra` (see TABLE_COLUMNS/
-# write_postgres) until it's worth promoting to one.
-FINE_TOTAL_YIELD_REGISTER = (5144, "U32", 0.1, "kWh")
+BATTERY_STATUS = {0: "standby", 1: "charging", 2: "discharging", 3: "sleep"}
+OPERATING_MODES = {0: "self_consumption", 1: "tou_mode", 3: "third_party_control", 4: "custom_mode",
+                   5: "socket_overlay_mode", 6: "smart_mode", 7: "dynamic_pricing"}
 
-# work_state_1's value mapping, same source as REGISTERS above. Not a bitmask despite the range --
-# each is a distinct sentinel value, not OR-able flags.
-WORK_STATES = {
-    0x0000: "Run",
-    0x8000: "Stop",
-    0x1300: "Key Stop",
-    0x1500: "Emergency Stop",
-    0x1400: "Standby",
-    0x1200: "Initial Standby",
-    0x1600: "Starting",
-    0x9100: "Alarm Run",
-    0x8100: "Derating Run",
-    0x8200: "Dispatch Run",
-    0x5500: "Fault",
-    0x2500: "Communication Fault",
+# The `source` value of the PV rows in POSTGRES_TABLE. "sungrow" although the PV now comes through
+# the battery, for the same reason P1_SOURCE stays "dsmr": it is a GROUP BY key in the solar
+# continuous aggregates and the filter of the daily-yield view, which diffs each day's highest
+# lifetime total against the previous day's. A new value would start a second series at the switch
+# and break that diff; with PV_TOTAL_OFFSET_KWH continuing the lifetime total, keeping the label
+# continues the series instead.
+SOLAR_SOURCE = "sungrow"
+BATTERY_SOURCE = "anker"
+
+# What poll_battery() returns as the solar values, which is what MQTT_PUBLISH_FIELDS is validated
+# against. daily_power_yields is added by the poll loop (see daily_yield_kwh) and can be absent.
+PUBLISHABLE_FIELDS = {"total_active_power", "total_power_yields", "total_power_yields_precise",
+                      "daily_power_yields"}
+
+# Fixed columns of the battery table; everything else poll_battery() returns lands in its `extra`.
+BATTERY_COLUMNS = {
+    "soc", "battery_power", "pv_power", "third_party_pv_power", "load_power", "grid_power",
+    "ac_output_power", "charge_energy_total", "discharge_energy_total", "pv_energy_total", "status",
+    "operating_mode",
 }
 
-SCAN_START_ADDRESS = min(addr for addr, *_ in REGISTERS.values())
-SCAN_END_ADDRESS = max(addr + (1 if dtype in ("U32", "S32") else 0) for addr, dtype, *_ in REGISTERS.values())
-SCAN_COUNT = SCAN_END_ADDRESS - SCAN_START_ADDRESS + 1
-
-# What poll_inverter() actually returns, which is not the same set as REGISTERS and is what
-# MQTT_PUBLISH_FIELDS has to be validated against. Two deliberate differences, both easy to get
-# backwards -- validate_config previously did, in both directions at once:
-#   - work_state_1 is read but popped before returning, replaced by the decoded `run_state`. Naming
-#     it in MQTT_PUBLISH_FIELDS silently publishes nothing.
-#   - total_power_yields_precise is not a REGISTERS entry (it comes from the separate
-#     FINE_TOTAL_YIELD_REGISTER round trip) but is publishable. It is also best-effort: on a
-#     firmware without register 5144 it is simply absent, so it belongs here as accepted-but-not-
-#     guaranteed rather than being treated as always present.
-PUBLISHABLE_FIELDS = (set(REGISTERS) - {"work_state_1"}) | {"run_state", "total_power_yields_precise"}
-
-# Fixed columns per table, matching the Postgres schema the deploying stack creates (see its
-# timescaledb init SQL). A field not listed here for its table lands in that table's `extra`
-# JSONB column instead of failing the insert, so a new Zigbee2MQTT field needs no code change here
-# -- only a schema/dashboard change once it's actually wanted.
-#
-# Note this does NOT extend to smart-meter fields, despite both going through write_postgres:
-# parse_p1_telegram maps OBIS codes through the fixed _ELEC_OBIS_MAP allowlist and discards
-# everything else before write_postgres ever sees it, so ELEC_TABLE's `extra` is always NULL and a
-# new OBIS code does need a code change. Real fields are still dropped this way today (the
-# power-failure and voltage sag/swell counters); adding one means extending _ELEC_OBIS_MAP, not
-# just the schema. The active tariff indicator (0-0:96.14.0) and L1 current (1-0:31.7.0) were
-# dropped this way until they were added to the map.
 TABLE_COLUMNS = {
-    POSTGRES_TABLE: set(REGISTERS) | {"run_state"},
+    # The solar table's other columns (strings, temperature, running time) belonged to the previous
+    # inverter and stay NULL: the Solarbank exposes no documented equivalent.
+    POSTGRES_TABLE: {"daily_power_yields", "total_power_yields", "total_active_power"},
+    BATTERY_TABLE: BATTERY_COLUMNS,
     # Must stay in step with the deploying stack's schema: a name listed here is written as a real
     # column, so adding one without the matching ALTER TABLE makes every insert fail. Apply the
     # schema change *before* deploying an image that adds a field here -- old code ignores a column
@@ -491,18 +433,13 @@ def _e(elec, field):
 # cached P1 reading (see get_elec_values), so no Postgres round-trip is involved and they stay
 # usable even if writes are failing. `e` is None (never accessed) when the metric doesn't need it.
 METRICS = {
-    # --- inverter only (always available) ---
-    # See _daily_generation_wh_corrected() and PVOUTPUT_USE_RAW_DAILY_YIELD above: daily_power_yields
-    # (the raw register) periodically fails to reset at midnight, so this diffs the lifetime
-    # counter against a locally-tracked midnight baseline instead of trusting it directly.
-    "daily_generation_wh": (False, lambda i, e: _daily_generation_wh_corrected(i)),
+    # --- from the battery poll (always available) ---
+    # daily_power_yields is the lifetime total minus the last total before local midnight, computed
+    # in the poll loop (daily_yield_kwh). Absent when there is no baseline, which omits v1.
+    "daily_generation_wh": (False, lambda i, e: round(i["daily_power_yields"] * 1000)),
     "total_generation_wh": (False, lambda i, e: round(i["total_power_yields"] * 1000)),
     "generation_w": (False, lambda i, e: i["total_active_power"]),
-    "dc_power_w": (False, lambda i, e: i["total_dc_power"]),
-    "inverter_voltage_v": (False, lambda i, e: i["phase_a_voltage"]),
-    # Inverter heatsink temperature, NOT ambient -- runs ~50 C in normal operation, so mapping it
-    # to v5 will skew PVOutput's insolation figures. The old SunGather config left it disabled.
-    "inverter_temp_c": (False, lambda i, e: i["internal_temperature"]),
+    "battery_soc": (False, lambda i, e: i["soc"]),
     # --- from the smart meter (grid side) ---
     "grid_import_w": (True, lambda i, e: round(_e(e, "electricity_currently_delivered") * 1000)),
     "grid_export_w": (True, lambda i, e: round(_e(e, "electricity_currently_returned") * 1000)),
@@ -513,29 +450,26 @@ METRICS = {
     "total_export_wh": (
         True, lambda i, e: round((_e(e, "electricity_returned_1") + _e(e, "electricity_returned_2")) * 1000)
     ),
-    # --- derived: what the house actually used (generation + import - export) ---
+    # --- derived: what the house actually used (grid + the battery unit's AC output) ---
+    # Not generation + grid any more: with a battery between the panels and the house, part of
+    # the generation goes into the cells and comes out later. The unit's AC output (register 10208,
+    # positive into the house) is what it actually delivers, whatever mix of panels and cells.
     "house_power_w": (
         True,
         lambda i, e: round(
-            i["total_active_power"]
+            i["ac_output_power"]
             + (_e(e, "electricity_currently_delivered") - _e(e, "electricity_currently_returned")) * 1000
         ),
     ),
-    "total_house_energy_wh": (
-        True,
-        lambda i, e: round(
-            i["total_power_yields"] * 1000
-            + (_e(e, "electricity_delivered_1") + _e(e, "electricity_delivered_2")) * 1000
-            - (_e(e, "electricity_returned_1") + _e(e, "electricity_returned_2")) * 1000
-        ),
-    ),
+    # No lifetime house energy: it would need a lifetime counter of the unit's AC output, and none
+    # has been identified (10264 counts at the cells and includes standby drain).
     # No daily_import_wh/daily_export_wh/daily_house_energy_wh equivalent: raw telegrams carry no
     # day-totals (see the comment above ENABLE_P1), so there's nothing to compute these from.
 }
 
 # Metrics that are lifetime counters rather than day totals. PVOutput's c1 flag has to agree with
 # whichever of these lands on v1/v3, or the uploaded energy figures come out wrong.
-LIFETIME_METRICS = {"total_generation_wh", "total_import_wh", "total_export_wh", "total_house_energy_wh"}
+LIFETIME_METRICS = {"total_generation_wh", "total_import_wh", "total_export_wh"}
 
 # PVOUTPUT_V1..V6 name a metric each; unset means that parameter is not uploaded. The defaults
 # reproduce exactly what the previous SunGather setup sent.
@@ -544,7 +478,7 @@ PVOUTPUT_MAPPING = {
     for param, name in (
         (param, env(f"PVOUTPUT_{param.upper()}", default))
         for param, default in (("v1", "daily_generation_wh"), ("v2", "generation_w"), ("v3", ""),
-                               ("v4", ""), ("v5", ""), ("v6", "inverter_voltage_v"))
+                               ("v4", ""), ("v5", ""), ("v6", ""))
     )
     if name
 }
@@ -565,12 +499,13 @@ _elec_lock = threading.Lock()
 _elec_cache = None
 
 # Today's local-midnight total_power_yields baseline, as (local_date, baseline_kwh), read/written
-# by _daily_generation_wh_corrected() from the pvoutput_loop thread. Refreshed lazily -- the cached
-# date just has to stop matching "today" for a new query to fire -- rather than on a timer, so a
-# missed refresh at exactly midnight self-heals on the very next PVOutput push instead of running
-# a whole day on a stale baseline.
+# by daily_yield_kwh() from the poll loop. Refreshed lazily -- the cached date just has to stop
+# matching "today" for a new query to fire -- rather than on a timer, so a missed refresh at exactly
+# midnight self-heals on the next poll. _daily_yield_retry_after holds off a failed lookup so a
+# database outage costs one query a minute, not one per poll.
 _daily_yield_lock = threading.Lock()
 _daily_yield_baseline = None
+_daily_yield_retry_after = 0.0
 # Monotonic time of the last electricity Postgres write, for P1_MIN_INTERVAL throttling. Owned
 # solely by p1_reader_loop's thread -- no lock needed.
 _last_elec_write_time = 0.0
@@ -597,27 +532,15 @@ _plug_seen = set()
 _write_queue = queue.Queue(maxsize=env_int("WRITE_QUEUE_SIZE", 2000))
 
 
-def decode_register(words, offset, datatype):
-    raw = words[offset]
-    if datatype == "U16":
-        return 0 if raw == 0xFFFF else raw
-    if datatype == "S16":
-        if raw in (0xFFFF, 0x7FFF):
-            return 0
-        return raw - 65536 if raw >= 32767 else raw
-    if datatype == "U32":
-        low, high = words[offset], words[offset + 1]
-        if low == 0xFFFF and high == 0xFFFF:
-            return 0
-        return low + high * 0x10000
-    if datatype == "S32":
-        low, high = words[offset], words[offset + 1]
-        if low == 0xFFFF and high in (0xFFFF, 0x7FFF):
-            return 0
-        if high >= 32767:
-            return low + high * 0x10000 - 0xFFFFFFFF - 1
-        return low + high * 0x10000
-    raise ValueError(f"Unsupported datatype {datatype}")
+def _u32(words, base, address):
+    """Big-endian 32-bit value at `address` in a block read starting at `base`."""
+    i = address - base
+    return (words[i] << 16) | words[i + 1]
+
+
+def _i32(words, base, address):
+    value = _u32(words, base, address)
+    return value - 0x100000000 if value & 0x80000000 else value
 
 
 # pymodbus renamed this argument from `slave` to `device_id` (3.14 dropped `slave` outright), so
@@ -630,44 +553,101 @@ _UNIT_KWARG = (
 )
 
 
-def poll_inverter(client):
-    result = client.read_input_registers(
-        SCAN_START_ADDRESS - 1, count=SCAN_COUNT, **{_UNIT_KWARG: INVERTER_SLAVE_ID}
-    )
+def _read(client, function, address, count):
+    """One read, function 3 (holding) or 4 (input). Never anything else: this code only reads."""
+    reader = {3: client.read_holding_registers, 4: client.read_input_registers}[function]
+    result = reader(address, count=count, **{_UNIT_KWARG: BATTERY_UNIT_ID})
     if result.isError():
-        raise OSError(f"Modbus read failed: {result}")
-    words = result.registers
+        raise OSError(f"Modbus read of {address} failed: {result}")
+    return result.registers
 
-    values = {}
-    for name, (address, datatype, accuracy, _unit) in REGISTERS.items():
-        value = decode_register(words, address - SCAN_START_ADDRESS, datatype)
-        values[name] = round(value * accuracy, 2) if accuracy else value
 
-    # work_state_1 (see WORK_STATES) turned out to be readable on this model too, despite an
-    # earlier assumption that run/system state registers were hybrid-only in Sungrow's protocol --
-    # replaces a synthetic "ON"/"OFF" derived from total_active_power > 0 with the inverter's own
-    # reported state. Unmapped codes are logged verbatim rather than silently dropped, so a new one
-    # shows up instead of just going missing.
-    work_state_raw = values.pop("work_state_1")
-    values["run_state"] = WORK_STATES.get(work_state_raw, f"Unknown (0x{work_state_raw:04X})")
-
-    # Separate round trip for FINE_TOTAL_YIELD_REGISTER (see its comment) -- optional, so a failure
-    # here (a firmware without this register, a mid-poll hiccup) drops only this one field into a
-    # log line rather than raising and losing the whole poll, which the main block above is not
-    # allowed to do.
+def _read_optional(client, function, address, count):
+    """A read whose failure costs only its own fields, not the poll."""
     try:
-        fine_address, fine_datatype, fine_accuracy, _fine_unit = FINE_TOTAL_YIELD_REGISTER
-        fine_result = client.read_input_registers(
-            fine_address - 1, count=2, **{_UNIT_KWARG: INVERTER_SLAVE_ID}
-        )
-        if fine_result.isError():
-            raise OSError(f"Modbus read failed: {fine_result}")
-        fine_value = decode_register(fine_result.registers, 0, fine_datatype)
-        values["total_power_yields_precise"] = round(fine_value * fine_accuracy, 2)
+        return _read(client, function, address, count)
     except Exception:
-        log.warning("Could not read fine-grained total yield register (5144)", exc_info=True)
+        log.debug("Optional read of %s failed", address, exc_info=True)
+        return None
 
-    return values
+
+def poll_battery(client):
+    """One poll. Returns (solar, battery): the PV values for POSTGRES_TABLE and the battery row.
+
+    The battery row keeps the field names the dashboards read; names not in BATTERY_COLUMNS land in
+    its `extra`. The undocumented registers are named after what they were shown to do; see the
+    comments.
+    """
+    a_base, a_count = BLOCK_A
+    b_base, b_count = BLOCK_B
+    a = _read(client, 4, a_base, a_count)
+    b = _read(client, 4, b_base, b_count)
+    mode = _read(client, 3, MODE_REGISTER, 1)[0]
+
+    soc = a[10014 - a_base]
+    if soc > 100:
+        raise ValueError(f"implausible state of charge {soc}")
+    status = a[10001 - a_base]
+    pv_power = _i32(a, a_base, 10002)
+    third_party_pv_power = _i32(a, a_base, 10004)
+    pv_energy_total = _u32(a, a_base, 10018) / 10
+
+    battery = {
+        "soc": soc,
+        # Positive = discharging, negative = charging (the device's own sign).
+        "battery_power": _i32(a, a_base, 10008),
+        "pv_power": pv_power,
+        "third_party_pv_power": third_party_pv_power,
+        # The unit's view of load and grid, from its own CT meter. Only as good as that meter's
+        # wiring; the P1 meter stays the source for grid figures.
+        "load_power": _i32(a, a_base, 10010),
+        "grid_power": _i32(a, a_base, 10012),
+        # What the unit delivers into the house circuit, positive into the house.
+        "ac_output_power": _i32(b, b_base, 10208),
+        # Lifetime counters at the cells, 0.1 kWh. The discharge counter includes standby drain.
+        "charge_energy_total": _u32(b, b_base, 10262) / 10,
+        "discharge_energy_total": _u32(b, b_base, 10264) / 10,
+        "pv_energy_total": pv_energy_total,
+        "status": BATTERY_STATUS.get(status, str(status)),
+        "operating_mode": OPERATING_MODES.get(mode, str(mode)),
+        # --- extra: undocumented, named after what they were shown to do ---
+        "soh": a[10015 - a_base],
+        "ac_voltage": b[10199 - b_base] / 10,
+        "ac_current": b[10205 - b_base] / 100,
+        # Not real power: ~30 idle, 0-79 while 800 W flowed. Kept raw, probably reactive power.
+        "ac_power_abs": _i32(b, b_base, 10210),
+        "frequency": b[10213 - b_base] / 100,
+        # Unknown; they step with the charging state. Kept raw until identified.
+        "raw_10224": b[10224 - b_base],
+        "raw_10227": b[10227 - b_base],
+        # 0.1 kWh counters identified from their step rate at a steady charge: energy in at the
+        # socket, and the unit's own consumption (conversion loss plus standby).
+        "socket_energy_in": _u32(a, a_base, 10030) / 10,
+        "own_use_energy": _u32(a, a_base, 10026) / 10,
+        "max_charge_power": _i32(a, a_base, 10036),
+        "max_discharge_power": _i32(a, a_base, 10038),
+        "rated_energy": _u32(b, b_base, 10250) / 10,
+    }
+    cell = _read_optional(client, 4, CELL_POWER_REGISTER, 2)
+    # Power into the cells, W, read on its own (a block read returns 0 for it).
+    battery["ac_power"] = _i32(cell, CELL_POWER_REGISTER, CELL_POWER_REGISTER) if cell else None
+    temperature = _read_optional(client, 4, TEMPERATURE_REGISTER, 1)
+    # 0.1 degrees C; matched the app's reading. Which sensor is not known.
+    battery["temperature"] = temperature[0] / 10 if temperature else None
+    limits = _read_optional(client, 3, *SOC_LIMIT_REGISTERS)
+    if limits:
+        battery.update(charge_limit_soc=limits[0], discharge_limit_soc=limits[1],
+                       backup_reserve_soc=limits[2], backup_reserve_enabled=limits[3])
+
+    total = round(PV_TOTAL_OFFSET_KWH + pv_energy_total, 1)
+    solar = {
+        # Same meaning as before the battery: what the panels produce, W.
+        "total_active_power": pv_power + third_party_pv_power,
+        # 0.1 kWh resolution. The _precise twin keeps the name the daily baseline reads from extra.
+        "total_power_yields": total,
+        "total_power_yields_precise": total,
+    }
+    return solar, battery
 
 
 _pg_conn = None
@@ -737,16 +717,16 @@ def get_last_gas_reading(before):
 
 
 def get_daily_yield_baseline(before):
-    """(total_power_yields, total_power_yields_precise-or-None) of the last "sungrow"-sourced row
+    """(total_power_yields, total_power_yields_precise-or-None) of the last SOLAR_SOURCE row
     in POSTGRES_TABLE strictly before `before` (a local midnight), or None if there isn't one.
 
     This is yesterday's final lifetime-yield reading, which is the same thing as today's starting
     point since total_power_yields is continuous across midnight -- see
-    _daily_generation_wh_corrected() below, and the README's "Solar daily yield" section for why
+    daily_yield_kwh() below, and the README's "Solar daily yield" section for why
     this reads the lifetime counter instead of trusting daily_power_yields (which periodically
     fails to reset). No lower bound, same reasoning as get_last_gas_reading: a genuine gap in our
     own polling right around midnight should still resolve against the last real reading, however
-    far back it is, rather than giving up. `source` is pinned to "sungrow" so a backfill/gapfill
+    far back it is, rather than giving up. `source` is pinned to SOLAR_SOURCE so a backfill/gapfill
     row (see backfill.py) is never picked as the baseline. Opens a short-lived connection rather
     than sharing the writer thread's persistent one -- this is refreshed at most once a day, from
     pvoutput_loop's thread."""
@@ -758,62 +738,46 @@ def get_daily_yield_baseline(before):
             cur.execute(
                 f"SELECT total_power_yields, (extra->>'total_power_yields_precise')::double precision "
                 f"FROM {POSTGRES_TABLE} WHERE time < %s AND source = %s ORDER BY time DESC LIMIT 1",
-                (before, "sungrow"),
+                (before, SOLAR_SOURCE),
             )
             return cur.fetchone()
 
 
-def _daily_generation_wh_corrected(inverter_values):
-    """daily_generation_wh for PVOutput's v1, computed as (today's lifetime yield) - (yesterday's
-    final lifetime yield) instead of trusting daily_power_yields directly.
+def daily_yield_kwh(total_kwh):
+    """Today's generation: `total_kwh` minus the last lifetime total before local midnight, or None
+    when there is no earlier row to start from (or the lookup is failing).
 
-    Prefers total_power_yields_precise (the 0.1 kWh-scaled twin) over total_power_yields (whole
-    kWh only -- see the README's "take two" section) for both today's value and the baseline, so a
-    day this small doesn't inherit the 1 kWh quantization step; falls back to total_power_yields on
-    either side if the precise read is missing (it's polled as an optional second round trip, see
-    poll_inverter). The baseline is cached per local day rather than looked up on every push, and
-    refreshed lazily -- see _daily_yield_baseline above.
-
-    Falls back to the raw register entirely if no baseline can be found at all (a genuine gap in
-    our own polling right around some past midnight -- get_daily_yield_baseline returning None),
-    trading the known reset bug for an upload rather than losing this push completely.
+    Diffing the lifetime counter is how every daily figure in the stack is computed (see the README's
+    "Solar daily yield" section), so the live value and the dashboards agree by construction. The
+    baseline is cached per local day; see _daily_yield_baseline.
     """
-    global _daily_yield_baseline
-    if PVOUTPUT_USE_RAW_DAILY_YIELD:
-        return round(inverter_values["daily_power_yields"] * 1000)
-
+    global _daily_yield_baseline, _daily_yield_retry_after
     now_local = datetime.now().astimezone()
     today = now_local.date()
     with _daily_yield_lock:
         cached = _daily_yield_baseline
 
     if cached is None or cached[0] != today:
+        if time.monotonic() < _daily_yield_retry_after:
+            return None
         local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         try:
             row = get_daily_yield_baseline(local_midnight)
         except Exception:
-            log.exception("Could not fetch daily-yield baseline; falling back to the raw register")
-            row = None
+            log.exception("Could not fetch the daily-yield baseline; retrying in a minute")
+            _daily_yield_retry_after = time.monotonic() + 60
+            return None
         if row is None:
-            log.warning(
-                "No solar row found before %s to use as a daily-yield baseline; "
-                "falling back to the raw daily_power_yields register",
-                local_midnight,
-            )
-            return round(inverter_values["daily_power_yields"] * 1000)
+            log.warning("No solar row before %s to start today's yield from", local_midnight)
+            _daily_yield_retry_after = time.monotonic() + 3600
+            return None
         baseline_total, baseline_precise = row
         cached = (today, baseline_precise if baseline_precise is not None else baseline_total)
         with _daily_yield_lock:
             _daily_yield_baseline = cached
 
-    _, baseline = cached
-    current = inverter_values.get("total_power_yields_precise")
-    if current is None:
-        current = inverter_values["total_power_yields"]
-    # max(0, ...) guards a boundary jitter (baseline read a few seconds into the next day, or a
-    # brief post-midnight dip before the diff catches up) rather than ever uploading negative
-    # generation.
-    return round(max(0.0, current - baseline) * 1000)
+    # max(0, ...) guards boundary jitter rather than ever reporting negative generation.
+    return round(max(0.0, total_kwh - cached[1]), 1)
 
 
 def publish_mqtt(mqtt_client, values, prefix, fields=None):
@@ -1139,14 +1103,12 @@ def _handle_p1_telegram(text):
                 except Exception:
                     log.exception("MQTT publish of electricity readings failed")
 
-            # Also refresh power_flow here, not just from the solar poll loop -- the smart meter
-            # keeps reporting all night even when the inverter is asleep and Modbus stops
-            # responding entirely, so this is what keeps house/grid from flatlining along with
-            # solar. Gated by the same throttle as the electricity write above -- it's derived
+            # Also refresh power_flow here, not just from the battery poll loop, so grid and house
+            # move at telegram cadence and grid_w keeps going when the battery can't be reached. Gated by the same throttle as the electricity write above -- it's derived
             # from the same reading, so there's no point storing it any more often.
             if ENABLE_DERIVED:
                 try:
-                    flow = derived_fields({"total_active_power": _solar_power_for_derived()}, elec)
+                    flow = derived_fields(_battery_values_for_derived(), elec)
                     # Can't be empty in practice (elec is truthy here, so grid_w is always set), but
                     # a point with no fields at all would be a row of nothing but a timestamp.
                     if flow:
@@ -1259,58 +1221,48 @@ def mqtt_watchdog_loop(mqtt_client):
             warned = True
 
 
-def _solar_power_for_derived():
-    """The inverter's current output for power_flow purposes, or None when it genuinely isn't known.
+def _battery_values_for_derived():
+    """The cached PV power and AC output for power_flow, or {} when the last poll is stale.
 
-    A fresh poll is used as-is. A *stale* one is ambiguous, and this used to resolve that ambiguity
-    by always substituting 0 W, on the stated grounds that the inverter goes offline overnight so a
-    stale poll must mean "asleep". That premise does not hold on this setup: the inverter stays
-    reachable around the clock and reports `Standby` at exactly 0 W all night, which is real data
-    arriving through the normal path -- 17280 rows/day, full 5-second coverage, verified over two
-    weeks. Nights were never relying on the substitution at all.
-
-    So in practice the substitution only ever fired when a poll genuinely failed, which is precisely
-    when 0 W is wrong. During a daytime Modbus dropout it reported a producing array as idle, and
-    because house = solar + import - export, an exporting house then computed as *negative*
-    consumption -- physically impossible, and silently persisted.
-
-    The state the inverter was last seen in resolves it without guessing: idle (IDLE_RUN_STATES) is
-    a real 0, and anything else means it was producing when contact was lost, so the honest answer
-    is None. Callers omit the field rather than write a number, matching what derived_fields already
-    does for a P1 outage: a gap in Grafana, not a plausible-looking zero.
+    Stale means unknown: the unit answers around the clock (0 W PV at night is a real reading
+    arriving through the normal path), so a poll older than SOLAR_STALE_AFTER means contact was
+    lost, and power_flow then omits solar_w and house_w rather than guessing. That is how the gap
+    shows in Grafana instead of as a plausible-looking 0, the same as for a P1 outage.
     """
     with _state_lock:
         age = None if latest_poll_monotonic is None else time.monotonic() - latest_poll_monotonic
-        power = latest_values.get("total_active_power")
-        run_state = latest_values.get("run_state")
-    if power is None or age is None:
-        return None  # nothing polled yet this run -- unknown, not zero
-    if age <= SOLAR_STALE_AFTER:
-        return power
-    return 0.0 if run_state in IDLE_RUN_STATES else None
+        cached = {k: latest_values.get(k) for k in ("total_active_power", "ac_output_power", "battery_power")}
+    if age is None or age > SOLAR_STALE_AFTER:
+        return {}
+    return {k: v for k, v in cached.items() if v is not None}
 
 
 def derived_fields(values, elec):
     """Power flow at one instant: what the panels produce, what the grid does, what the house uses.
 
     grid_w is signed the way a meter reads: positive drawing from the grid, negative feeding back.
+    house_w = grid_w + the battery unit's AC output: the panels feed the house only through the
+    unit, so its AC output is everything the house gets that isn't from the grid, whether it came
+    from the panels directly or out of the cells. (Before the battery it was solar + grid.) The
+    battery terms go into `extra` so the formula can be checked against the stored row.
 
-    Every field is omitted rather than zeroed when its inputs aren't known, so an outage shows as a
-    gap in Grafana instead of a plausible-looking 0 W. That applies symmetrically to both sides:
-    no fresh electricity data drops grid_w and house_w, and a solar reading of None (see
-    _solar_power_for_derived) drops solar_w and house_w. house_w needs both, so it survives only
-    when both are known -- it is the field that would otherwise absorb the error and turn negative.
-    grid_w comes straight off the meter and is unaffected by anything the inverter is doing.
+    Every field is omitted rather than zeroed when its inputs aren't known: no fresh electricity
+    drops grid_w and house_w, a stale battery poll drops solar_w and house_w.
     """
     fields = {}
     solar = values.get("total_active_power")
+    ac_output = values.get("ac_output_power")
     if solar is not None:
         fields["solar_w"] = float(solar)
+    if ac_output is not None:
+        fields["battery_ac_w"] = float(ac_output)
+    if values.get("battery_power") is not None:
+        fields["battery_w"] = float(values["battery_power"])
     if elec:
         imported = METRICS["grid_import_w"][1](values, elec)
         exported = METRICS["grid_export_w"][1](values, elec)
         fields["grid_w"] = float(imported - exported)
-        if solar is not None:
+        if ac_output is not None:
             fields["house_w"] = float(METRICS["house_power_w"][1](values, elec))
     return fields
 
@@ -1825,23 +1777,13 @@ def validate_config():
             "lost, but the two are meant to be separable.", MQTT_TOPIC_PREFIX,
         )
 
-    # work_state_1 is excluded here because it gets its own, more specific warning below; leaving
-    # it in would report the same field twice under two different explanations.
-    unknown = MQTT_PUBLISH_FIELDS - PUBLISHABLE_FIELDS - {"work_state_1"}
+    unknown = MQTT_PUBLISH_FIELDS - PUBLISHABLE_FIELDS
     if unknown:
         log.warning(
             "MQTT_PUBLISH_FIELDS contains unknown field(s) %s -- they will never be published. "
             "Known fields: %s",
             ", ".join(sorted(unknown)),
             ", ".join(sorted(PUBLISHABLE_FIELDS)),
-        )
-    if "work_state_1" in MQTT_PUBLISH_FIELDS:
-        # Called out separately rather than lumped in with `unknown`: work_state_1 is a real
-        # register, so "unknown field" would be wrong and would send someone looking in the wrong
-        # place. It is simply the raw code, and poll_inverter replaces it with the decoded name.
-        log.warning(
-            "MQTT_PUBLISH_FIELDS contains work_state_1, which is never published -- it is decoded "
-            "into run_state before publishing. Use run_state instead."
         )
 
     if ENABLE_PVOUTPUT and not (PVOUTPUT_API_KEY and PVOUTPUT_SYSTEM_ID):
@@ -1935,10 +1877,10 @@ def validate_config():
 
 def main():
     log.info(
-        "Starting energy-monitor: inverter=%s:%s scan_interval=%ss p1=%s(%s) p1_relay=%s(%s:%s) "
+        "Starting energy-monitor: battery=%s:%s scan_interval=%ss p1=%s(%s) p1_relay=%s(%s:%s) "
         "mqtt_publish=%s(%s,%s) plugs=%s(%d) pvoutput=%s mindergas=%s monta=%s",
-        INVERTER_HOST,
-        INVERTER_PORT,
+        BATTERY_HOST,
+        BATTERY_PORT,
         SCAN_INTERVAL,
         ENABLE_P1,
         P1_URL or f"{P1_HOST}:{P1_PORT}",
@@ -1958,7 +1900,7 @@ def main():
 
     global latest_poll_monotonic, _mqtt_client
 
-    modbus_client = ModbusTcpClient(INVERTER_HOST, port=INVERTER_PORT, timeout=10)
+    modbus_client = ModbusTcpClient(BATTERY_HOST, port=BATTERY_PORT, timeout=5)
     # Skip the broker entirely when nothing publishes to it and nothing subscribes through it,
     # rather than holding a connection the watchdog would then warn about every MQTT_WARN_AFTER.
     mqtt_client = mqtt_connect() if MQTT_ENABLED else None
@@ -1980,31 +1922,36 @@ def main():
         cycle_started = time.monotonic()
         try:
             if not modbus_client.connected and not modbus_client.connect():
-                raise OSError(f"Could not connect to inverter at {INVERTER_HOST}:{INVERTER_PORT}")
+                raise OSError(f"Could not connect to the battery at {BATTERY_HOST}:{BATTERY_PORT}")
 
-            values = poll_inverter(modbus_client)
+            values, battery = poll_battery(modbus_client)
             ts_ns = time.time_ns()
+            daily = daily_yield_kwh(values["total_power_yields"])
+            if daily is not None:
+                values["daily_power_yields"] = daily
             with _state_lock:
                 latest_values.clear()
                 latest_values.update(values)
+                # The battery terms power_flow and PVOutput need, alongside the solar values.
+                for key in ("ac_output_power", "battery_power", "soc"):
+                    latest_values[key] = battery[key]
                 latest_poll_monotonic = time.monotonic()
 
             log.info(
-                "Poll ok: ac=%sW dc=%sW daily=%skWh temp=%sC",
-                values["total_active_power"],
-                values["total_dc_power"],
-                values["daily_power_yields"],
-                values["internal_temperature"],
+                "Poll ok: pv=%sW battery=%sW soc=%s%% ac_out=%sW today=%skWh",
+                values["total_active_power"], battery["battery_power"], battery["soc"],
+                battery["ac_output_power"], daily,
             )
 
-            # Each sink is independent: a Postgres outage must not stop MQTT updates (the
-            # physical display reads those) and vice versa. The Postgres write is queued rather
-            # than performed here, so its latency never stretches the poll interval.
-            queue_write(values, ts_ns, POSTGRES_TABLE, "sungrow")
+            # Each sink is independent: a Postgres outage must not stop MQTT updates and vice
+            # versa. Writes are queued rather than performed here, so their latency never stretches
+            # the poll interval.
+            queue_write(values, ts_ns, POSTGRES_TABLE, SOLAR_SOURCE)
+            queue_write(battery, ts_ns, BATTERY_TABLE, BATTERY_SOURCE)
             if ENABLE_DERIVED:
                 try:
                     queue_write(
-                        derived_fields(values, get_elec_values() if ENABLE_P1 else None),
+                        derived_fields({**values, **battery}, get_elec_values() if ENABLE_P1 else None),
                         ts_ns,
                         DERIVED_TABLE,
                         "derived",
@@ -2017,7 +1964,7 @@ def main():
                 except Exception:
                     log.exception("MQTT publish failed")
         except Exception:
-            log.exception("Inverter poll failed")
+            log.exception("Battery poll failed")
             # pymodbus does not reliably flip `.connected` back to False after a send-time
             # socket error (observed: BrokenPipeError leaves it True), so the `not
             # modbus_client.connected` check above would otherwise never trip again and this

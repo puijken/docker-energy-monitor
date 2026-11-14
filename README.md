@@ -159,7 +159,8 @@ such in `poll_battery()`. Facts the reads rely on, all verified on the device:
 - Addresses are wire addresses (no 1-based offset). Unit id 1; any id other than 0 or 1 gets no
   answer at all, so a wrong id is a timeout, not an exception.
 - A read must start on the first word of a value. Inside a block read the firmware returns 0 for
-  some undocumented registers, so those (10254, 10156) are read on their own.
+  some undocumented registers, so those (10254, 10156) are read on their own. The string inputs
+  (10167–10170) are one small block of their own; the addresses around them are unmapped.
 - **Read-only.** 10064 (operating mode), 10071 (power setpoint) and 60000–60003 (charge limits) are
   writable; `_read()` only issues function codes 3 and 4.
 
@@ -168,6 +169,8 @@ such in `poll_battery()`. Facts the reads rely on, all verified on the device:
 | `solar.total_active_power` | 10002 + 10004 | PV and third-party PV power, W |
 | `solar.total_power_yields` | 10018 (0.1 kWh) + `PV_TOTAL_OFFSET_KWH` | Lifetime PV, kWh |
 | `solar.daily_power_yields` | derived | Lifetime total minus the last one before local midnight |
+| `solar.mppt_1_voltage`, `mppt_1_current`, `mppt_2_voltage`, `mppt_2_current` | 10167–10170 (0.1 V, 0.01 A, one word each) | The two string inputs. Undocumented; identified on a sunny day: V × A of both strings matched 10002 within about 1 % |
+| `solar.total_dc_power` | derived | PV1 V × A + PV2 V × A, W |
 | `battery.battery_power` | 10008 | W, positive = discharging |
 | `battery.ac_output_power` | 10208 | W the unit delivers into the house |
 | `battery.load_power`, `grid_power` | 10010, 10012 | The unit's view from its own CT meter; only as good as that meter's wiring. Not used in any calculation |

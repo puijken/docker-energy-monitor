@@ -552,6 +552,10 @@ def _i32(words, base, address):
     return value - 0x100000000 if value & 0x80000000 else value
 
 
+def _i16(word):
+    return word - 0x10000 if word & 0x8000 else word
+
+
 # pymodbus renamed this argument from `slave` to `device_id` (3.14 dropped `slave` outright), so
 # resolve it from the signature instead of hardcoding either name. Dependabot auto-merges anything
 # it doesn't classify as semver-major, which has already silently moved this pin once.
@@ -658,12 +662,21 @@ def poll_battery(client):
     }
     mppt = _read_optional(client, 4, *MPPT_REGISTERS)
     if mppt:
-        v1, i1, v2, i2 = mppt[0] / 10, mppt[1] / 100, mppt[2] / 10, mppt[3] / 100
-        solar.update(mppt_1_voltage=v1, mppt_1_current=i1, mppt_2_voltage=v2, mppt_2_current=i2,
-                     # DC power of both strings, W. Tracks 10002 within about 1 %; a separate
-                     # figure, not a check on it.
-                     total_dc_power=round(v1 * i1 + v2 * i2))
+        solar.update(_mppt_fields(mppt))
     return solar, battery
+
+
+def _mppt_fields(words):
+    """The solar columns from the four MPPT words (PV1 V, PV1 A, PV2 V, PV2 A).
+
+    The currents are signed: at dusk a string reads a few hundredths of an amp below zero, which
+    an unsigned decode turns into 655 A (and tens of kW of DC power).
+    """
+    v1, i1, v2, i2 = words[0] / 10, _i16(words[1]) / 100, words[2] / 10, _i16(words[3]) / 100
+    return {"mppt_1_voltage": v1, "mppt_1_current": i1, "mppt_2_voltage": v2, "mppt_2_current": i2,
+            # DC power of both strings, W. Tracks 10002 within about 1 %; a separate figure, not
+            # a check on it.
+            "total_dc_power": round(v1 * i1 + v2 * i2)}
 
 
 _pg_conn = None

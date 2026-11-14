@@ -1595,6 +1595,22 @@ def check_derived_fields(failures):
         print("  derived fields: house = grid + battery AC output; omitted (not zeroed) without either input")
 
 
+def check_mppt_negative_current(failures):
+    """At dusk a string current dips a few hundredths of an amp below zero. Read unsigned, the
+    words 65535 and 65532 become 655.35 A and tens of kW of DC power. These words are the ones
+    the battery sent at dusk on the first sunny day."""
+    got = app._mppt_fields([1209, 65535, 1678, 10])
+    want = {"mppt_1_voltage": 120.9, "mppt_1_current": -0.01, "mppt_2_voltage": 167.8,
+            "mppt_2_current": 0.1, "total_dc_power": 16}
+    if got != want:
+        failures.append(f"  mppt negative current: expected {want}, got {got}")
+    got = app._mppt_fields([439, 2, 998, 65534])
+    if got["mppt_2_current"] != -0.02 or got["total_dc_power"] != -1:
+        failures.append(f"  mppt negative current on PV2: got {got}")
+    else:
+        print("  mppt: negative string current decoded signed (no 655 A at dusk)")
+
+
 def check_solar_stale_fallback(failures):
     """_battery_values_for_derived(): a fresh poll gives its values, a stale one gives nothing, so
     power_flow leaves a gap instead of a plausible-looking 0."""
@@ -1835,6 +1851,7 @@ def main():
     check_pvoutput_metrics(failures)
     check_daily_generation_wh_corrected(failures)
     check_derived_fields(failures)
+    check_mppt_negative_current(failures)
     check_solar_stale_fallback(failures)
     check_telegram_buffer_cap(failures)
     check_publishable_fields(failures)
@@ -1853,7 +1870,7 @@ def main():
           "postgres write, postgres write retry, clean stop, postgres read, P1 telegram parsing, "
           "P1 relay broadcast, P1 stall reconnect, P1 over HTTP, plug parsing, DSMR timestamps (incl. DST fall-back), "
           "smart-meter source stability, pvoutput metrics, daily generation yield correction, "
-          "derived fields, solar staleness fallback, "
+          "derived fields, mppt negative current, solar staleness fallback, "
           "telegram buffer cap, publishable fields, pvoutput interval guard, log level, monta")
     return 0
 

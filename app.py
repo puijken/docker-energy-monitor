@@ -371,6 +371,11 @@ MODE_REGISTER = 10064   # holding register
 CELL_POWER_REGISTER = 10254
 TEMPERATURE_REGISTER = 10156
 SOC_LIMIT_REGISTERS = (60000, 4)
+# The two MPPT (string) inputs, undocumented: PV1 voltage (0.1 V), PV1 current (0.01 A), then the
+# same for PV2, one word each. Identified on a sunny morning: voltage x current of both strings
+# added up to the PV power in 10002 within about 1 %. A block read of these four matches single
+# reads; the neighbouring addresses are unmapped, so the block cannot be widened.
+MPPT_REGISTERS = (10167, 4)
 
 BATTERY_STATUS = {0: "standby", 1: "charging", 2: "discharging", 3: "sleep"}
 OPERATING_MODES = {0: "self_consumption", 1: "tou_mode", 3: "third_party_control", 4: "custom_mode",
@@ -386,9 +391,11 @@ SOLAR_SOURCE = "sungrow"
 BATTERY_SOURCE = "anker"
 
 # What poll_battery() returns as the solar values, which is what MQTT_PUBLISH_FIELDS is validated
-# against. daily_power_yields is added by the poll loop (see daily_yield_kwh) and can be absent.
+# against. daily_power_yields is added by the poll loop (see daily_yield_kwh) and can be absent, and
+# the string fields are absent when their (optional) read fails.
 PUBLISHABLE_FIELDS = {"total_active_power", "total_power_yields", "total_power_yields_precise",
-                      "daily_power_yields"}
+                      "daily_power_yields", "mppt_1_voltage", "mppt_1_current", "mppt_2_voltage",
+                      "mppt_2_current", "total_dc_power"}
 
 # Fixed columns of the battery table; everything else poll_battery() returns lands in its `extra`.
 BATTERY_COLUMNS = {
@@ -398,9 +405,11 @@ BATTERY_COLUMNS = {
 }
 
 TABLE_COLUMNS = {
-    # The solar table's other columns (strings, temperature, running time) belonged to the previous
-    # inverter and stay NULL: the Solarbank exposes no documented equivalent.
-    POSTGRES_TABLE: {"daily_power_yields", "total_power_yields", "total_active_power"},
+    # The string columns were the previous inverter's and are filled again from the Solarbank's
+    # MPPT registers. The rest (temperature, running time, AC side) stay NULL: no equivalent.
+    POSTGRES_TABLE: {"daily_power_yields", "total_power_yields", "total_active_power",
+                     "mppt_1_voltage", "mppt_1_current", "mppt_2_voltage", "mppt_2_current",
+                     "total_dc_power"},
     BATTERY_TABLE: BATTERY_COLUMNS,
     # Must stay in step with the deploying stack's schema: a name listed here is written as a real
     # column, so adding one without the matching ALTER TABLE makes every insert fail. Apply the
@@ -647,6 +656,13 @@ def poll_battery(client):
         "total_power_yields": total,
         "total_power_yields_precise": total,
     }
+    mppt = _read_optional(client, 4, *MPPT_REGISTERS)
+    if mppt:
+        v1, i1, v2, i2 = mppt[0] / 10, mppt[1] / 100, mppt[2] / 10, mppt[3] / 100
+        solar.update(mppt_1_voltage=v1, mppt_1_current=i1, mppt_2_voltage=v2, mppt_2_current=i2,
+                     # DC power of both strings, W. Tracks 10002 within about 1 %; a separate
+                     # figure, not a check on it.
+                     total_dc_power=round(v1 * i1 + v2 * i2))
     return solar, battery
 
 

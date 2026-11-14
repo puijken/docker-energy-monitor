@@ -127,6 +127,8 @@ RAW = {
     **dict(zip((10036, 10037), _words32(3500))),
     **dict(zip((10038, 10039), _words32(3500))),
     10156: 241,                             # temperature 24.1 C (read on its own)
+    10167: 2726, 10168: 600,                # PV1 272.6 V, 6.00 A -> 1635.6 W
+    10169: 2989, 10170: 239,                # PV2 298.9 V, 2.39 A -> 714.4 W; together the 2350 W PV
     10199: 2264, 10205: 196, 10213: 4998, 10224: 56, 10227: 56,
     **dict(zip((10208, 10209), _words32(430))),     # AC output into the house
     **dict(zip((10210, 10211), _words32(12))),
@@ -141,6 +143,8 @@ EXPECTED_SOLAR = {
     "total_active_power": 2350,
     "total_power_yields": 27875.3,
     "total_power_yields_precise": 27875.3,
+    "mppt_1_voltage": 272.6, "mppt_1_current": 6.0, "mppt_2_voltage": 298.9, "mppt_2_current": 2.39,
+    "total_dc_power": 2350,
 }
 EXPECTED_BATTERY = {
     "soc": 63, "battery_power": -1820, "pv_power": 2350, "third_party_pv_power": 0,

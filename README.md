@@ -367,7 +367,12 @@ row's `extra` so the formula can be checked afterwards.
 One limit, measured: register 10208 only counts output. While the unit charged at 800 W from AC it
 stayed 0, so whenever the battery charges from the grid, `house_w` includes that charging power.
 In self-consumption mode it charges from the panels only, so this doesn't arise in normal use.
-Daily totals downstream can subtract the unit's AC-input counter (10030, `socket_energy_in`).
+Daily totals downstream have to subtract the energy that went in through the AC port. Register
+10030 (stored as `socket_energy_in`) is **not** that in general: Anker's Modbus spec calls it "total
+purchased energy", i.e. grid import as the unit measures it. Without a paired smart meter that is
+its own AC port; with a smart meter (CT clamps) it is the house's grid import as the meter sees it.
+Integrate the AC port's power while the unit is charging from AC instead. The same goes for 10026
+(`own_use_energy`): "total load consumption" in the spec, not the unit's own use.
 
 ## Smart plugs (Zigbee2MQTT)
 

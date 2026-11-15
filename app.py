@@ -349,6 +349,10 @@ MONTA_TIMES = parse_monta_times(MONTA_TIMES_RAW)
 MONTA_RETRY_INTERVAL = env_int("MONTA_RETRY_INTERVAL", 900)
 MONTA_LOOKBACK_DAYS = env_int("MONTA_LOOKBACK_DAYS", 0)   # 0 = everything, every run
 MONTA_TABLE = env("MONTA_TABLE", "monta_charges")
+# One row per outside service (pvoutput, mindergas, monta) with its last attempt, last success and
+# last error, so a dashboard can show whether uploads still work. Empty disables it. See
+# record_upload().
+UPLOAD_STATUS_TABLE = env("UPLOAD_STATUS_TABLE", "upload_status")
 MONTA_VAT_RATE = float(env("MONTA_VAT_RATE", str(stroohm_monta_api.DEFAULT_VAT_RATE)))
 MONTA_COLUMNS = ["id", "human_readable_id", "state", "charge_point_id", "started_at", "stopped_at",
                  "energy_kwh", "price_incl_vat", "price_excl_vat", "currency", "raw"]
@@ -855,10 +859,10 @@ def push_pvoutput(values):
     params = build_pvoutput_params(values)
     if not {"v1", "v2"} & params.keys():
         log.error("PVOutput needs at least v1 or v2; nothing uploadable in %s", params)
-        return
+        return False
     if not ENABLE_PVOUTPUT:
         log.info("PVOutput push skipped (ENABLE_PVOUTPUT=false), would send: %s", params)
-        return
+        return False
     resp = requests.post(
         "https://pvoutput.org/service/r2/addstatus.jsp",
         headers={"X-Pvoutput-Apikey": PVOUTPUT_API_KEY, "X-Pvoutput-SystemId": PVOUTPUT_SYSTEM_ID},
@@ -870,6 +874,7 @@ def push_pvoutput(values):
     if resp.status_code != 200:
         raise AssertionError(f"PVOutput rejected the upload: {resp.status_code} {resp.text}")
     log.info("Pushed to PVOutput: %s", params)
+    return True
 
 
 def push_mindergas():
@@ -895,7 +900,7 @@ def push_mindergas():
 
     if not ENABLE_MINDERGAS:
         log.info("Mindergas push skipped (ENABLE_MINDERGAS=false), would send: %s", payload)
-        return
+        return None
 
     resp = requests.post(
         MINDERGAS_API_URL,
@@ -906,6 +911,7 @@ def push_mindergas():
     if resp.status_code != 201:
         raise AssertionError(f"Unexpected status code from Mindergas: {resp.status_code} {resp.text}")
     log.info("Pushed to Mindergas: %s", payload)
+    return payload
 
 
 def _on_mqtt_message(client, userdata, message):
@@ -1447,6 +1453,43 @@ def shutdown(reason):
     return 0
 
 
+_upload_status_warned = False
+
+
+def record_upload(service, ok, detail=None, error=None):
+    """Upserts this attempt into UPLOAD_STATUS_TABLE: last_attempt always, last_ok only when `ok`,
+    last_error = `error` (cleared by a success), detail kept from the last call that gave one.
+
+    Never raises: the upload itself already happened (or failed) and is logged either way, so a
+    missing table or a database outage must not turn into a failed upload or a retry. It opens its
+    own short-lived connection, like sync_monta(), rather than borrowing the writer thread's
+    persistent one, which is not shared across threads. One warning, not one per call, when it
+    can't write (an older schema without the table, say).
+    """
+    global _upload_status_warned
+    if not UPLOAD_STATUS_TABLE:
+        return
+    sql = (f"INSERT INTO {UPLOAD_STATUS_TABLE} (service, last_attempt, last_ok, last_error, detail) "
+           f"VALUES (%s, now(), CASE WHEN %s THEN now() END, %s, %s) "
+           f"ON CONFLICT (service) DO UPDATE SET last_attempt = EXCLUDED.last_attempt, "
+           f"last_ok = COALESCE(EXCLUDED.last_ok, {UPLOAD_STATUS_TABLE}.last_ok), "
+           f"last_error = EXCLUDED.last_error, "
+           f"detail = COALESCE(EXCLUDED.detail, {UPLOAD_STATUS_TABLE}.detail)")
+    try:
+        with psycopg.connect(
+            host=POSTGRES_HOST, port=POSTGRES_PORT, dbname=POSTGRES_DB,
+            user=POSTGRES_USER, password=POSTGRES_PASSWORD, connect_timeout=5,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (service, bool(ok), None if ok else (str(error) or "failed")[:500],
+                                  None if detail is None else str(detail)[:200]))
+        _upload_status_warned = False
+    except Exception as exc:
+        if not _upload_status_warned:
+            log.warning("Could not record %s upload status in %s: %s", service, UPLOAD_STATUS_TABLE, exc)
+            _upload_status_warned = True
+
+
 def sync_monta(client=None):
     """Fetch completed Monta sessions and upsert them into MONTA_TABLE in one transaction.
     Returns the number of sessions written. `client` is injectable for the smoke test."""
@@ -1502,9 +1545,11 @@ def monta_loop():
         slot = latest_monta_slot(now, MONTA_TIMES)
         if slot != served:
             try:
-                sync_monta()
+                n = sync_monta()
                 served = slot
-            except Exception:
+                record_upload("monta", True, detail=f"{n} session(s)")
+            except Exception as exc:
+                record_upload("monta", False, error=exc)
                 log.exception("Monta sync failed; retrying in %ss", MONTA_RETRY_INTERVAL)
                 time.sleep(MONTA_RETRY_INTERVAL)
                 continue
@@ -1543,8 +1588,10 @@ def pvoutput_loop():
             log.warning("Skipping PVOutput push: last successful poll was %.0fs ago", age)
             continue
         try:
-            push_pvoutput(values)
-        except Exception:
+            if push_pvoutput(values):
+                record_upload("pvoutput", True)
+        except Exception as exc:
+            record_upload("pvoutput", False, error=exc)
             log.exception("PVOutput push failed")
 
 
@@ -1562,9 +1609,12 @@ def mindergas_loop():
         due = now.hour == MINDERGAS_HOUR and now.minute >= MINDERGAS_MINUTE
         if due and completed_for != now.date():
             try:
-                push_mindergas()
+                sent = push_mindergas()
                 completed_for = now.date()
-            except Exception:
+                if sent:
+                    record_upload("mindergas", True, detail=f"{sent['date']}: {sent['reading']} m3")
+            except Exception as exc:
+                record_upload("mindergas", False, error=exc)
                 log.exception("Mindergas push failed; retrying in %ss", MINDERGAS_RETRY_INTERVAL)
                 time.sleep(MINDERGAS_RETRY_INTERVAL)
                 continue

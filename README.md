@@ -123,6 +123,7 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `MONTA_TIMES` | `04:00,21:00` | Local times of day to fetch, comma-separated (it also runs once at startup) |
 | `MONTA_LOOKBACK_DAYS` | `0` | Only re-fetch sessions created in the last N days; `0` re-fetches everything every run |
 | `MONTA_TABLE` | `monta_charges` | Table the sessions are upserted into (on `id`) |
+| `UPLOAD_STATUS_TABLE` | `upload_status` | Table that records each PVOutput, Mindergas and Monta attempt (see [Upload status](#upload-status)); empty disables it |
 | `MONTA_VAT_RATE` | `0.21` | VAT included in Monta's `price`, used for `price_excl_vat` |
 | `MONTA_RETRY_INTERVAL` | `900` | Seconds between retries after a failed fetch |
 | `TZ` | *(container default)* | Timezone for scheduling/logging |
@@ -496,6 +497,29 @@ value. It reads the gas data this container itself wrote from the P1 telegram st
 
 Timestamps are timezone-aware on purpose: Postgres stores `timestamptz` as UTC and interprets a
 naive value as the session's local time, so passing naive local time here would be ambiguous.
+
+## Upload status
+
+After every PVOutput upload, Mindergas upload and Monta sync, the service upserts one row per
+service into `UPLOAD_STATUS_TABLE`: `last_attempt` always, `last_ok` only on success, `last_error`
+holding the failure text (cleared by the next success) and a short `detail` (the Mindergas reading
+sent, the number of Monta sessions). That lets a dashboard show whether the uploads still work
+without reading container logs. Create the table before deploying an image that writes it:
+
+```sql
+CREATE TABLE IF NOT EXISTS upload_status (
+    service      text PRIMARY KEY,
+    last_attempt timestamptz NOT NULL,
+    last_ok      timestamptz,
+    last_error   text,
+    detail       text
+);
+```
+
+Recording never fails an upload: it opens its own short-lived connection, and when it can't write
+(no table yet, database down) it logs one warning and carries on. A skipped upload (the
+`ENABLE_*` switch off, data too old) records nothing. The cost is one tiny upsert per upload: every
+`PVOUTPUT_INTERVAL` (5 minutes by default) plus a few a day for the other two.
 
 ## Tests
 

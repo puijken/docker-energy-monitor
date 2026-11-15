@@ -174,6 +174,10 @@ Key structures/functions to know before editing:
 - `build_pvoutput_params` / `push_pvoutput` — maps `PVOUTPUT_V1`…`V6` metric names to values;
   validates the `PVOUTPUT_CUMULATIVE_FLAG`/lifetime-metric combination at startup (see README's
   PVOutput mapping section before touching this).
+- `record_upload` — called by `pvoutput_loop`, `mindergas_loop` and `monta_loop` after each
+  attempt (`push_pvoutput` returns True and `push_mindergas` the payload only when something was
+  actually sent). Upserts into `UPLOAD_STATUS_TABLE` on its own short-lived connection and never
+  raises, so a status write can't fail or retry an upload.
 - `get_last_gas_reading` / `push_mindergas` — reads gas history back out of Postgres (not the
   in-memory cache, unlike PVOutput) to find the last reading strictly before local midnight.
 - `TABLE_COLUMNS` / `write_postgres` — a field not listed for its table lands in that table's

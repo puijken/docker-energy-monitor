@@ -1485,6 +1485,44 @@ def check_publishable_fields(failures):
         print(f"  publishable fields: {len(app.PUBLISHABLE_FIELDS)} fields match the real poll")
 
 
+def check_record_upload(failures):
+    """record_upload(): the upsert it sends for a success and a failure, and that a database error
+    never escapes (an upload that worked must not be retried because its status couldn't be saved).
+    """
+    before = len(failures)
+    orig_connect, orig_warned = app.psycopg.connect, app._upload_status_warned
+    try:
+        fake = _FakeConnection()
+        app.psycopg.connect = lambda **kwargs: fake
+        app.record_upload("pvoutput", True)
+        app.record_upload("mindergas", False, error=AssertionError("Unexpected status code from Mindergas: 500"))
+        app.record_upload("monta", True, detail="3 session(s)")
+        (sql, p1), (_, p2), (_, p3) = fake.cursor_obj.executed
+        if "ON CONFLICT (service) DO UPDATE" not in sql or app.UPLOAD_STATUS_TABLE not in sql:
+            failures.append(f"  record_upload: unexpected SQL {sql!r}")
+        if tuple(p1) != ("pvoutput", True, None, None):
+            failures.append(f"  record_upload success params: {p1!r}")
+        if p2[0] != "mindergas" or p2[1] is not False or "500" not in (p2[2] or "") or p2[3] is not None:
+            failures.append(f"  record_upload failure params: {p2!r}")
+        if tuple(p3) != ("monta", True, None, "3 session(s)"):
+            failures.append(f"  record_upload detail params: {p3!r}")
+
+        def _explode(**kwargs):
+            raise app.psycopg.OperationalError("relation does not exist")
+        app.psycopg.connect = _explode
+        app._upload_status_warned = False
+        app.record_upload("pvoutput", True)   # must not raise
+        app.record_upload("pvoutput", True)
+        if not app._upload_status_warned:
+            failures.append("  record_upload: a database error should leave one warning flag set")
+    except Exception as exc:
+        failures.append(f"  record_upload raised {exc!r}")
+    finally:
+        app.psycopg.connect, app._upload_status_warned = orig_connect, orig_warned
+    if len(failures) == before:
+        print("  record_upload: upsert per service, error text on failure, never raises")
+
+
 def check_pvoutput_interval_guard(failures):
     """pvoutput_loop() must not divide by PVOUTPUT_INTERVAL before checking it.
 
@@ -1858,6 +1896,7 @@ def main():
     check_pvoutput_interval_guard(failures)
     check_log_level(failures)
     check_monta(failures)
+    check_record_upload(failures)
 
     signal.alarm(0)
 
@@ -1871,7 +1910,7 @@ def main():
           "P1 relay broadcast, P1 stall reconnect, P1 over HTTP, plug parsing, DSMR timestamps (incl. DST fall-back), "
           "smart-meter source stability, pvoutput metrics, daily generation yield correction, "
           "derived fields, mppt negative current, solar staleness fallback, "
-          "telegram buffer cap, publishable fields, pvoutput interval guard, log level, monta")
+          "telegram buffer cap, publishable fields, pvoutput interval guard, log level, monta, upload status")
     return 0
 
 

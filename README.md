@@ -70,7 +70,7 @@ Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `
 | `POSTGRES_HOST` | *required* | TimescaleDB/Postgres hostname, e.g. `timescaledb` |
 | `POSTGRES_PORT` | `5432` | Postgres port |
 | `POSTGRES_DB` | `energy` | Database name |
-| `POSTGRES_USER` | *required* | Database user |
+| `POSTGRES_USER` | *required* | Database user. It needs no superuser or owner rights: `SELECT`, `INSERT`, `UPDATE` on the tables it writes (every write is an upsert), plus whatever triggers on those tables touch |
 | `POSTGRES_PASSWORD` | *required* | Database password |
 | `POSTGRES_TABLE` | `solar` | Table name written to for the PV readings |
 | `WRITE_QUEUE_SIZE` | `2000` | Max points buffered for the Postgres writer thread. While the database is unreachable the writer holds its current point and retries (1 s → 30 s backoff), so this queue is what bridges the outage; at a few points per second the default covers roughly half an hour. Past that the oldest queued point is dropped first rather than growing without bound. A point the database *rejects* (bad data, unknown column) is logged and dropped at once, so it can't block the ones behind it. |

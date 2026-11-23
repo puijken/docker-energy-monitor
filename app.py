@@ -445,6 +445,30 @@ def _e(elec, field):
 # don't need electricity come straight from the Modbus poll and always work; the rest read the
 # cached P1 reading (see get_elec_values), so no Postgres round-trip is involved and they stay
 # usable even if writes are failing. `e` is None (never accessed) when the metric doesn't need it.
+# The unit's AC port power (register 10208) carries no sign: it reads the same positive number
+# whether the port delivers to the house or the unit charges from the socket (seen 2026-11-23:
+# +3325 W while the cells took 3382 W and the panels gave 270 W). The direction follows from the
+# energy balance: when the cells take more than the panels deliver, the rest comes in through the
+# port. PORT_IN_MARGIN_W keeps sample timing and conversion losses from flipping it; the port's
+# V x A (about 30 VA reactive when idle) must also clearly carry power.
+PORT_IN_MARGIN_W = 50
+
+
+def port_flow(values):
+    """(output, input) of the unit's AC port in W, from one poll's values: (10208, 0) when it
+    delivers, (0, V x A) when it feeds the cells from the socket, (None, None) without 10208."""
+    output = values.get("ac_output_power")
+    if output is None:
+        return None, None
+    cells = values.get("battery_power")
+    voltage, current = values.get("ac_voltage"), values.get("ac_current")
+    if cells is not None and voltage is not None and current is not None:
+        port_va = voltage * current
+        if -cells - (values.get("total_active_power") or 0) > PORT_IN_MARGIN_W and port_va > PORT_IN_MARGIN_W:
+            return 0.0, float(port_va)
+    return float(output), 0.0
+
+
 METRICS = {
     # --- from the battery poll (always available) ---
     # daily_power_yields is the lifetime total minus the last total before local midnight, computed
@@ -465,12 +489,13 @@ METRICS = {
     ),
     # --- derived: what the house actually used (grid + the battery unit's AC output) ---
     # Not generation + grid any more: with a battery between the panels and the house, part of
-    # the generation goes into the cells and comes out later. The unit's AC output (register 10208,
-    # positive into the house) is what it actually delivers, whatever mix of panels and cells.
+    # the generation goes into the cells and comes out later. The unit's AC output is what it
+    # actually delivers, whatever mix of panels and cells; while it charges from the socket, that
+    # input is taken off instead (see port_flow).
     "house_power_w": (
         True,
         lambda i, e: round(
-            i["ac_output_power"]
+            port_flow(i)[0] - port_flow(i)[1]
             + (_e(e, "electricity_currently_delivered") - _e(e, "electricity_currently_returned")) * 1000
         ),
     ),
@@ -1266,7 +1291,8 @@ def _battery_values_for_derived():
     """
     with _state_lock:
         age = None if latest_poll_monotonic is None else time.monotonic() - latest_poll_monotonic
-        cached = {k: latest_values.get(k) for k in ("total_active_power", "ac_output_power", "battery_power")}
+        cached = {k: latest_values.get(k) for k in ("total_active_power", "ac_output_power", "battery_power",
+                                                    "ac_voltage", "ac_current")}
     if age is None or age > SOLAR_STALE_AFTER:
         return {}
     return {k: v for k, v in cached.items() if v is not None}
@@ -1279,20 +1305,23 @@ def derived_fields(values, elec):
     house_w = grid_w + the battery unit's AC output: the panels feed the house only through the
     unit, so its AC output is everything the house gets that isn't from the grid, whether it came
     from the panels directly or out of the cells. (Before the battery it was solar + grid.) The
-    battery terms go into `extra` so the formula can be checked against the stored row. Limit:
-    10208 only counts output (it stays 0 while the unit charges from AC), so charging from the grid
-    shows up as house use here; in self-consumption mode the unit only charges from the panels.
+    battery terms go into `extra` so the formula can be checked against the stored row. While the
+    unit charges from the socket, register 10208 reads that input as a positive number too, so
+    port_flow() decides the direction: battery_ac_w is then 0, socket_in_w the port's V x A, and
+    house_w = grid_w - socket_in_w.
 
     Every field is omitted rather than zeroed when its inputs aren't known: no fresh electricity
     drops grid_w and house_w, a stale battery poll drops solar_w and house_w.
     """
     fields = {}
     solar = values.get("total_active_power")
-    ac_output = values.get("ac_output_power")
+    ac_output, socket_in = port_flow(values)
     if solar is not None:
         fields["solar_w"] = float(solar)
     if ac_output is not None:
-        fields["battery_ac_w"] = float(ac_output)
+        fields["battery_ac_w"] = ac_output
+    if socket_in:
+        fields["socket_in_w"] = round(socket_in, 1)
     if values.get("battery_power") is not None:
         fields["battery_w"] = float(values["battery_power"])
     if elec:
@@ -2014,7 +2043,7 @@ def main():
                 latest_values.clear()
                 latest_values.update(values)
                 # The battery terms power_flow and PVOutput need, alongside the solar values.
-                for key in ("ac_output_power", "battery_power", "soc"):
+                for key in ("ac_output_power", "battery_power", "soc", "ac_voltage", "ac_current"):
                     latest_values[key] = battery[key]
                 latest_poll_monotonic = time.monotonic()
 

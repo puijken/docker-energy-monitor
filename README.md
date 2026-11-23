@@ -173,7 +173,7 @@ such in `poll_battery()`. Facts the reads rely on, all verified on the device:
 | `solar.mppt_1_voltage`, `mppt_1_current`, `mppt_2_voltage`, `mppt_2_current` | 10167–10170 (0.1 V, 0.01 A signed, one word each) | The two string inputs. Undocumented; identified on a sunny day: V × A of both strings matched 10002 within about 1 % |
 | `solar.total_dc_power` | derived | PV1 V × A + PV2 V × A, W |
 | `battery.battery_power` | 10008 | W, positive = discharging |
-| `battery.ac_output_power` | 10208 | W the unit delivers into the house |
+| `battery.ac_output_power` | 10208 | W at the AC port, **without a sign**: delivering to the house or charging from the socket (see House use with a battery) |
 | `battery.load_power`, `grid_power` | 10010, 10012 | The unit's view from its own CT meter; only as good as that meter's wiring. Not used in any calculation |
 | `battery.soc` | 10014 | % |
 | `battery.charge/discharge_energy_total` | 10262, 10264 (0.1 kWh) | At the cells; discharge includes standby drain |
@@ -365,14 +365,18 @@ use. The panels reach the house only through the unit, so its AC output is every
 that isn't from the grid. `battery_ac_w` and `battery_w` (power at the cells) are stored in the
 row's `extra` so the formula can be checked afterwards.
 
-One limit, measured: register 10208 only counts output. While the unit charged at 800 W from AC it
-stayed 0, so whenever the battery charges from the grid, `house_w` includes that charging power.
-In self-consumption mode it charges from the panels only, so this doesn't arise in normal use.
-Daily totals downstream have to subtract the energy that went in through the AC port. Register
-10030 (stored as `socket_energy_in`) is **not** that in general: Anker's Modbus spec calls it "total
+Register 10208 carries **no sign**: it is the AC port's power whichever way it runs. In one mode
+(800 W from the socket in the app's custom mode) it stayed 0 while the unit charged; in
+self-consumption mode, charging ~3.4 kW from the socket, it read +3,325 W, the same as delivering
+that much to the house. So the direction comes from the energy balance (`port_flow`): when the
+cells take more than the panels deliver (by more than `PORT_IN_MARGIN_W`, 50 W) and the port's
+V × A clearly carries power, the port feeds **in**. Then `battery_ac_w` is 0, `socket_in_w` (in
+`extra`) is the port's V × A, and `house_w = grid_w − socket_in_w`. The same rule applies to the
+`house_power_w` metric. Daily totals downstream should use the same rule. Register
+10030 (stored as `socket_energy_in`) is **not** the socket input in general: Anker's Modbus spec calls it "total
 purchased energy", i.e. grid import as the unit measures it. Without a paired smart meter that is
 its own AC port; with a smart meter (CT clamps) it is the house's grid import as the meter sees it.
-Integrate the AC port's power while the unit is charging from AC instead. The same goes for 10026
+The same goes for 10026
 (`own_use_energy`): "total load consumption" in the spec, not the unit's own use.
 
 ## Smart plugs (Zigbee2MQTT)

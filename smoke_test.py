@@ -1629,8 +1629,40 @@ def check_derived_fields(failures):
     if set(no_battery) != {"grid_w"}:
         failures.append(f"  derived fields without the battery: expected only grid_w, got {sorted(no_battery)}")
 
+    # The port runs both ways, but 10208 has no sign. These are the readings of 2026-11-23 16:00
+    # (charging from the socket in self-consumption mode): 10208 = 3325 W while the cells took
+    # 3382 W and the panels gave 270 W, so the 3325 W came in. House = grid - socket input.
+    charging = {"total_active_power": 270, "ac_output_power": 3325, "battery_power": -3382,
+                "ac_voltage": 221.0, "ac_current": 15.2}
+    grid_in = {"electricity_currently_delivered": 3.61, "electricity_currently_returned": 0.0}
+    got = app.derived_fields(charging, grid_in)
+    want = {"solar_w": 270.0, "grid_w": 3610.0, "house_w": 251.0, "battery_ac_w": 0.0,
+            "socket_in_w": 3359.2, "battery_w": -3382.0}
+    if got != want:
+        failures.append(f"  derived fields, charging from the socket: expected {want}, got {got}")
+    # The same with 10208 at 0 while charging (seen 2026-11-12 in Anker's custom mode).
+    got = app.derived_fields({**charging, "ac_output_power": 0}, grid_in)
+    if got.get("house_w") != 251.0 or got.get("socket_in_w") != 3359.2:
+        failures.append(f"  derived fields, charging with 10208 at 0: got {got}")
+    # Delivering while the sun shines (2026-11-23 15:25): the port runs out, nothing changes.
+    delivering = {"total_active_power": 319, "ac_output_power": 559, "battery_power": 240,
+                  "ac_voltage": 230.0, "ac_current": 1.33}
+    got = app.derived_fields(delivering, elec)
+    if got.get("house_w") != 439.0 or got.get("battery_ac_w") != 559.0 or "socket_in_w" in got:
+        failures.append(f"  derived fields, delivering: got {got}")
+    # Charging from the panels alone, with the port idle (~30 VA reactive): no socket input.
+    solar_charge = {"total_active_power": 810, "ac_output_power": 104, "battery_power": -706,
+                    "ac_voltage": 230.0, "ac_current": 0.13}
+    got = app.derived_fields(solar_charge, elec)
+    if got.get("house_w") != -16.0 or "socket_in_w" in got:
+        failures.append(f"  derived fields, charging from the panels: got {got}")
+    # PVOutput's house_power_w follows the same rule.
+    if app.METRICS["house_power_w"][1](charging, grid_in) != 251:
+        failures.append(f"  house_power_w while charging from the socket: got {app.METRICS['house_power_w'][1](charging, grid_in)}")
+
     if len(failures) == before:
-        print("  derived fields: house = grid + battery AC output; omitted (not zeroed) without either input")
+        print("  derived fields: house = grid + battery AC output, or grid - socket input while the port feeds in;"
+              " omitted (not zeroed) without either input")
 
 
 def check_mppt_negative_current(failures):

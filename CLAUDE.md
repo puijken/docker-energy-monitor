@@ -169,7 +169,9 @@ Key structures/functions to know before editing:
   instant) from independently-timestamped battery and P1 readings. **`house_w = grid_w + the unit's
   AC output` (10208)**, not PV + grid: with a battery, PV + grid counts charging as house use. Never
   use the unit's own load/grid registers (10010/10012) for this; they come from its CT meter and
-  are only as good as its wiring. A stale battery poll omits `solar_w`/`house_w` rather than
+  are only as good as its wiring. **10208 has no sign**: `port_flow()` decides the port's direction
+  from the energy balance (cells taking more than the panels give means the rest came in through
+  the port), and then `house_w = grid_w - socket_in_w`. A stale battery poll omits `solar_w`/`house_w` rather than
   substituting 0; a P1 gap likewise omits grid/house.
 - `build_pvoutput_params` / `push_pvoutput` — maps `PVOUTPUT_V1`…`V6` metric names to values;
   validates the `PVOUTPUT_CUMULATIVE_FLAG`/lifetime-metric combination at startup (see README's

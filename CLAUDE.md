@@ -63,7 +63,7 @@ classes, just module-level globals guarded by `_state_lock` (or their own dedica
 `_elec_lock`) and daemon threads started from `main()`:
 
 - **Main thread** — the battery poll loop (`SCAN_INTERVAL` seconds): connects Modbus, calls
-  `poll_battery`, adds `daily_yield_kwh`, updates `latest_values`/`latest_poll_monotonic` under the
+  `poll_battery`, adds `pv_energy_today_kwh`, updates `latest_values`/`latest_poll_monotonic` under the
   lock, queues the `solar` and `battery` writes, computes `derived_fields` (power_flow), and publishes to MQTT if
   `ENABLE_MQTT_PUBLISH`. Each sink is wrapped
   in its own `try/except` so a Postgres or MQTT outage can't stop the others.
@@ -138,8 +138,11 @@ Key structures/functions to know before editing:
   10064 (mode), 10071 (setpoint) and 60000–60003 (charge limits) are writable.
 - `SOLAR_SOURCE = "sungrow"` — kept from the replaced inverter, like `P1_SOURCE`: a GROUP BY key
   downstream; `PV_TOTAL_OFFSET_KWH` continues the lifetime series.
-- `daily_yield_kwh` — today's yield = lifetime total minus the last total before local midnight
-  (cached per day, DB lookup held off on failure).
+- `pv_energy_today_kwh` — today's yield = the PV power (10002) added up, each reading until the next
+  (at most `PV_ENERGY_MAX_GAP_S`, 60 s), the same rule the deploying stack uses for its daily
+  figures. Seeded once per process from Postgres (`get_pv_energy_today`), so a restart mid-day loses
+  nothing; reset in memory when the local date changes; a failing seed is held off for a minute.
+  Not the lifetime PV counter (10018): on one day it ran ~15 % under the unit's own PV power.
 - `publish_mqtt` — takes the prefix and an optional field allowlist, so one function serves both
   topic trees. Called from *two* threads: the poll loop (solar, `MQTT_TOPIC_PREFIX`) and
   `_handle_p1_telegram` (electricity, `MQTT_ELEC_TOPIC_PREFIX`, on the same throttle as the

@@ -169,7 +169,7 @@ such in `poll_battery()`. Facts the reads rely on, all verified on the device:
 |---|---|---|
 | `solar.total_active_power` | 10002 + 10004 | PV and third-party PV power, W |
 | `solar.total_power_yields` | 10018 (0.1 kWh) + `PV_TOTAL_OFFSET_KWH` | Lifetime PV, kWh |
-| `solar.daily_power_yields` | derived | Lifetime total minus the last one before local midnight |
+| `solar.daily_power_yields` | derived | Today's PV power (10002) added up, each reading until the next (at most 60 s); not the lifetime counter, which ran ~15 % low on one day |
 | `solar.mppt_1_voltage`, `mppt_1_current`, `mppt_2_voltage`, `mppt_2_current` | 10167–10170 (0.1 V, 0.01 A signed, one word each) | The two string inputs. Undocumented; identified on a sunny day: V × A of both strings matched 10002 within about 1 % |
 | `solar.total_dc_power` | derived | PV1 V × A + PV2 V × A, W |
 | `battery.battery_power` | 10008 | W, positive = discharging |
@@ -412,7 +412,7 @@ The defaults:
 
 | Metric | Unit | Source | Notes |
 |---|---|---|---|
-| `daily_generation_wh` | Wh | battery | Day total: lifetime total minus the last one before midnight. Omitted until a baseline exists |
+| `daily_generation_wh` | Wh | battery | Day total: the PV power added up since local midnight (`solar.daily_power_yields`). Seeded from Postgres when the container starts mid-day; omitted while that seed fails |
 | `total_generation_wh` | Wh | battery | Lifetime counter (including `PV_TOTAL_OFFSET_KWH`) |
 | `generation_w` | W | battery | Current PV power |
 | `battery_soc` | % | battery | State of charge |

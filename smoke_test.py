@@ -62,8 +62,8 @@ surface at runtime. This file now additionally covers, all without a real broker
   - The PVOutput metric formulas in app.METRICS, and that build_pvoutput_params() degrades to
     battery-only output when no electricity data is cached; power_flow's house_w = grid + the
     battery unit's AC output.
-  - The daily yield (app.daily_yield_kwh()): a cached baseline is used without touching Postgres, a
-    cache miss queries and caches app.get_daily_yield_baseline(), no baseline gives None.
+  - Today's generation (app.pv_energy_today_kwh()): the PV power added up, gaps capped, seeded once
+    from Postgres (app.get_pv_energy_today()), 0 at a new day, a failing seed held off.
   - Stroohm/Monta (ENABLE_MONTA): that the stroohm_monta_api.py downloaded at build still gives the
     session fields app.sync_monta() relies on, sync_monta()'s upsert against a fake Postgres
     connection, and MONTA_TIMES parsing / due-slot selection. The API client's own behaviour
@@ -83,7 +83,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from queue import Empty
 
 os.environ.setdefault("BATTERY_HOST", "127.0.0.1")
@@ -1763,12 +1763,14 @@ def check_pvoutput_metrics(failures):
         print("  pvoutput metrics: house = grid + battery AC output; degrades without P1 or a daily baseline")
 
 
-def check_daily_generation_wh_corrected(failures):
-    """app.daily_yield_kwh(): today's generation from the lifetime total and the last total before
-    local midnight, which is how every daily figure in the stack is computed."""
+def check_pv_energy_today(failures):
+    """app.pv_energy_today_kwh(): today's generation is the PV power added up (each reading until the
+    next, at most PV_ENERGY_MAX_GAP_S), seeded once from Postgres so a restart loses nothing, started
+    at 0 when the date changes, and held off for a minute when the seed fails."""
     before = len(failures)
-    today = datetime.now().astimezone().date()
-    saved = (app._daily_yield_baseline, app._daily_yield_retry_after, app.psycopg.connect)
+    saved = (app._pv_energy, app._pv_energy_retry_after, app.psycopg.connect)
+    tz = datetime.now().astimezone().tzinfo
+    t0 = datetime(2026, 11, 23, 12, 0, 0, tzinfo=tz)
 
     def _explode(**kwargs):
         raise AssertionError("psycopg.connect() should not have been called")
@@ -1776,41 +1778,54 @@ def check_daily_generation_wh_corrected(failures):
     previous_level = app.log.level
     app.log.setLevel(logging.CRITICAL)
     try:
-        # 1. Cache hit: never touches Postgres.
-        app._daily_yield_baseline = (today, 12345.5)
-        app._daily_yield_retry_after = 0.0
+        # 1. Process start mid-day: 1000 Wh stored so far, the last stored reading 600 W at t0.
+        app._pv_energy, app._pv_energy_retry_after = None, 0.0
+        app.psycopg.connect = lambda **kwargs: _FakeConnection(fetch_result=(1000.0, t0, 600.0))
+        got = app.pv_energy_today_kwh(700.0, t0 + timedelta(seconds=5))     # + 600 W x 5 s
+        if got != round((1000 + 600 * 5 / 3600) / 1000, 3):
+            failures.append(f"  pv energy, seeded: expected 1.001, got {got}")
+        # 2. Next poll in memory only: + 700 W x 5 s.
         app.psycopg.connect = _explode
-        got = app.daily_yield_kwh(12354.3)
-        if got != 8.8:
-            failures.append(f"  daily_yield_kwh() cache hit: expected 8.8, got {got}")
-
-        # 2. Cache miss: queries, prefers the precise baseline, caches it.
-        app._daily_yield_baseline = None
-        app.psycopg.connect = lambda **kwargs: _FakeConnection(fetch_result=(12345, 12345.5))
-        got = app.daily_yield_kwh(12354.3)
-        if got != 8.8 or app._daily_yield_baseline != (today, 12345.5):
-            failures.append(f"  daily_yield_kwh() cache miss: got {got}, cache {app._daily_yield_baseline!r}")
-
-        # 3. No row before midnight: None, and no new query on the next poll.
-        app._daily_yield_baseline = None
-        app.psycopg.connect = lambda **kwargs: _FakeConnection(fetch_result=None)
-        got = app.daily_yield_kwh(12354.3)
+        got = app.pv_energy_today_kwh(800.0, t0 + timedelta(seconds=10))
+        want = round((1000 + 600 * 5 / 3600 + 700 * 5 / 3600) / 1000, 3)
+        if got != want:
+            failures.append(f"  pv energy, next poll: expected {want}, got {got}")
+        # 3. A five-minute gap counts the last reading for 60 s only.
+        got = app.pv_energy_today_kwh(0.0, t0 + timedelta(seconds=310))
+        want = round((1000 + 600 * 5 / 3600 + 700 * 5 / 3600 + 800 * 60 / 3600) / 1000, 3)
+        if got != want:
+            failures.append(f"  pv energy, gap capped: expected {want}, got {got}")
+        # 4. A new day starts at 0, without asking Postgres.
+        got = app.pv_energy_today_kwh(50.0, t0 + timedelta(days=1))
+        again = app.pv_energy_today_kwh(50.0, t0 + timedelta(days=1, seconds=36))
+        if got != 0.0 or again != round(50 * 36 / 3600 / 1000, 3):
+            failures.append(f"  pv energy, new day: expected 0.0 then 0.001 (rounded), got {got}, {again}")
+        # 5. No stored reading today yet: starts at 0.
+        app._pv_energy = None
+        app.psycopg.connect = lambda **kwargs: _FakeConnection(fetch_result=(0, None, None))
+        got = app.pv_energy_today_kwh(300.0, t0)
+        if got != 0.0:
+            failures.append(f"  pv energy, nothing stored yet: expected 0.0, got {got}")
+        # 6. The seed fails: None, and no second query within the minute.
+        app._pv_energy, app._pv_energy_retry_after = None, 0.0
+        def _fail(**kwargs):
+            raise app.psycopg.OperationalError("down")
+        app.psycopg.connect = _fail
+        got = app.pv_energy_today_kwh(300.0, t0)
         app.psycopg.connect = _explode
-        again = app.daily_yield_kwh(12354.3)
+        again = app.pv_energy_today_kwh(300.0, t0 + timedelta(seconds=5))
         if got is not None or again is not None:
-            failures.append(f"  daily_yield_kwh() without a baseline: expected None twice, got {got}, {again}")
-
-        # 4. Never negative.
-        app._daily_yield_baseline = (today, 12359.0)
-        if app.daily_yield_kwh(12354.3) != 0.0:
-            failures.append("  daily_yield_kwh() went negative below the baseline")
+            failures.append(f"  pv energy, seed failing: expected None twice, got {got}, {again}")
+        # 7. PVOutput's v1 is that figure in Wh.
+        if app.METRICS["daily_generation_wh"][1]({"daily_power_yields": 1.234}, None) != 1234:
+            failures.append("  daily_generation_wh is not daily_power_yields in Wh")
     finally:
-        app._daily_yield_baseline, app._daily_yield_retry_after, app.psycopg.connect = saved
+        app._pv_energy, app._pv_energy_retry_after, app.psycopg.connect = saved
         app.log.setLevel(previous_level)
 
     if len(failures) == before:
-        print("  daily yield: cache hit skips Postgres, cache miss queries and caches, no row gives None "
-              "(held off), never negative")
+        print("  pv energy today: power added up (gaps capped at 60 s), seeded once from Postgres, "
+              "0 at a new day, a failing seed held off; v1 follows")
 
 
 def _monta_charge(i, **over):
@@ -1919,7 +1934,7 @@ def main():
     check_dsmr_timestamp_parsing(failures)
     check_smart_meter_source_is_stable(failures)
     check_pvoutput_metrics(failures)
-    check_daily_generation_wh_corrected(failures)
+    check_pv_energy_today(failures)
     check_derived_fields(failures)
     check_mppt_negative_current(failures)
     check_solar_stale_fallback(failures)
@@ -1940,7 +1955,7 @@ def main():
     print("smoke test passed: modbus, battery read-only, battery reconnect after broken pipe, mqtt connect, mqtt publish switch, "
           "postgres write, postgres write retry, clean stop, postgres read, P1 telegram parsing, "
           "P1 relay broadcast, P1 stall reconnect, P1 over HTTP, plug parsing, DSMR timestamps (incl. DST fall-back), "
-          "smart-meter source stability, pvoutput metrics, daily generation yield correction, "
+          "smart-meter source stability, pvoutput metrics, pv energy today, "
           "derived fields, mppt negative current, solar staleness fallback, "
           "telegram buffer cap, publishable fields, pvoutput interval guard, log level, monta, upload status")
     return 0

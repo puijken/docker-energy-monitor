@@ -395,7 +395,7 @@ SOLAR_SOURCE = "sungrow"
 BATTERY_SOURCE = "anker"
 
 # What poll_battery() returns as the solar values, which is what MQTT_PUBLISH_FIELDS is validated
-# against. daily_power_yields is added by the poll loop (see daily_yield_kwh) and can be absent, and
+# against. daily_power_yields is added by the poll loop (see pv_energy_today_kwh) and can be absent, and
 # the string fields are absent when their (optional) read fails.
 PUBLISHABLE_FIELDS = {"total_active_power", "total_power_yields", "total_power_yields_precise",
                       "daily_power_yields", "mppt_1_voltage", "mppt_1_current", "mppt_2_voltage",
@@ -471,8 +471,8 @@ def port_flow(values):
 
 METRICS = {
     # --- from the battery poll (always available) ---
-    # daily_power_yields is the lifetime total minus the last total before local midnight, computed
-    # in the poll loop (daily_yield_kwh). Absent when there is no baseline, which omits v1.
+    # daily_power_yields is today's PV power added up (pv_energy_today_kwh), computed in the poll
+    # loop. Absent until today's figure could be seeded from Postgres, which omits v1.
     "daily_generation_wh": (False, lambda i, e: round(i["daily_power_yields"] * 1000)),
     "total_generation_wh": (False, lambda i, e: round(i["total_power_yields"] * 1000)),
     "generation_w": (False, lambda i, e: i["total_active_power"]),
@@ -536,14 +536,16 @@ _mqtt_client = None
 _elec_lock = threading.Lock()
 _elec_cache = None
 
-# Today's local-midnight total_power_yields baseline, as (local_date, baseline_kwh), read/written
-# by daily_yield_kwh() from the poll loop. Refreshed lazily -- the cached date just has to stop
-# matching "today" for a new query to fire -- rather than on a timer, so a missed refresh at exactly
-# midnight self-heals on the next poll. _daily_yield_retry_after holds off a failed lookup so a
-# database outage costs one query a minute, not one per poll.
-_daily_yield_lock = threading.Lock()
-_daily_yield_baseline = None
-_daily_yield_retry_after = 0.0
+# Today's PV energy so far, as (local_date, wh, time of the last reading, its power in W), kept by
+# pv_energy_today_kwh() from the poll loop. Seeded once from Postgres when the process starts (so a
+# restart mid-day loses nothing), then added to in memory and reset at local midnight.
+# _pv_energy_retry_after holds off a failed seed so a database outage costs one query a minute.
+_pv_energy_lock = threading.Lock()
+_pv_energy = None
+_pv_energy_retry_after = 0.0
+# A reading counts until the next one, but never for longer than this: a gap in polling is not
+# filled with the last power seen. The same cap as the deploying stack's daily figures.
+PV_ENERGY_MAX_GAP_S = 60
 # Monotonic time of the last electricity Postgres write, for P1_MIN_INTERVAL throttling. Owned
 # solely by p1_reader_loop's thread -- no lock needed.
 _last_elec_write_time = 0.0
@@ -774,68 +776,65 @@ def get_last_gas_reading(before):
             return cur.fetchone()
 
 
-def get_daily_yield_baseline(before):
-    """(total_power_yields, total_power_yields_precise-or-None) of the last SOLAR_SOURCE row
-    in POSTGRES_TABLE strictly before `before` (a local midnight), or None if there isn't one.
-
-    This is yesterday's final lifetime-yield reading, which is the same thing as today's starting
-    point since total_power_yields is continuous across midnight -- see
-    daily_yield_kwh() below, and the README's "Solar daily yield" section for why
-    this reads the lifetime counter instead of trusting daily_power_yields (which periodically
-    fails to reset). No lower bound, same reasoning as get_last_gas_reading: a genuine gap in our
-    own polling right around midnight should still resolve against the last real reading, however
-    far back it is, rather than giving up. `source` is pinned to SOLAR_SOURCE so a backfill/gapfill
-    row (see backfill.py) is never picked as the baseline. Opens a short-lived connection rather
-    than sharing the writer thread's persistent one -- this is refreshed at most once a day, from
-    pvoutput_loop's thread."""
+def get_pv_energy_today(since):
+    """(Wh, time of the last reading, its power) from the SOLAR_SOURCE rows since `since` (a local
+    midnight), each reading counted until the next one and at most PV_ENERGY_MAX_GAP_S; (0, None,
+    None) when there is no row yet. Opens a short-lived connection; called once per process start."""
     with psycopg.connect(
         host=POSTGRES_HOST, port=POSTGRES_PORT, dbname=POSTGRES_DB,
         user=POSTGRES_USER, password=POSTGRES_PASSWORD,
     ) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"SELECT total_power_yields, (extra->>'total_power_yields_precise')::double precision "
-                f"FROM {POSTGRES_TABLE} WHERE time < %s AND source = %s ORDER BY time DESC LIMIT 1",
-                (before, SOLAR_SOURCE),
+                f"SELECT coalesce(sum(p * least(dt, %s)), 0) / 3600.0, max(time), "
+                f"(array_agg(p ORDER BY time DESC))[1] FROM ("
+                f"  SELECT time, total_active_power AS p,"
+                f"         extract(epoch FROM lead(time) OVER (ORDER BY time) - time)::double precision AS dt"
+                f"  FROM {POSTGRES_TABLE} WHERE time >= %s AND source = %s) r",
+                (PV_ENERGY_MAX_GAP_S, since, SOLAR_SOURCE),
             )
             return cur.fetchone()
 
 
-def daily_yield_kwh(total_kwh):
-    """Today's generation: `total_kwh` minus the last lifetime total before local midnight, or None
-    when there is no earlier row to start from (or the lookup is failing).
+def pv_energy_today_kwh(power_w, at):
+    """Today's PV energy in kWh up to the reading `power_w` (W) taken at `at` (an aware datetime),
+    or None while today's figure can't be seeded from Postgres.
 
-    Diffing the lifetime counter is how every daily figure in the stack is computed (see the README's
-    "Solar daily yield" section), so the live value and the dashboards agree by construction. The
-    baseline is cached per local day; see _daily_yield_baseline.
+    The PV power (register 10002) added up: each reading counts until the next one, at most
+    PV_ENERGY_MAX_GAP_S. Not the unit's lifetime PV counter (10018): on one day that ran ~15 % under
+    its own PV power, while the vendor's app matched the power added up. Seeded from Postgres once,
+    when the process starts on a day that already has readings, so a restart loses nothing; from
+    then on kept in memory, and started at 0 when the local date changes.
     """
-    global _daily_yield_baseline, _daily_yield_retry_after
-    now_local = datetime.now().astimezone()
-    today = now_local.date()
-    with _daily_yield_lock:
-        cached = _daily_yield_baseline
+    global _pv_energy, _pv_energy_retry_after
+    today = at.astimezone().date()
+    with _pv_energy_lock:
+        state = _pv_energy
 
-    if cached is None or cached[0] != today:
-        if time.monotonic() < _daily_yield_retry_after:
+    if state is None:
+        if time.monotonic() < _pv_energy_retry_after:
             return None
-        local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        midnight = at.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
         try:
-            row = get_daily_yield_baseline(local_midnight)
+            wh, last_time, last_power = get_pv_energy_today(midnight)
         except Exception:
-            log.exception("Could not fetch the daily-yield baseline; retrying in a minute")
-            _daily_yield_retry_after = time.monotonic() + 60
+            log.exception("Could not read today's PV energy so far; retrying in a minute")
+            _pv_energy_retry_after = time.monotonic() + 60
             return None
-        if row is None:
-            log.warning("No solar row before %s to start today's yield from", local_midnight)
-            _daily_yield_retry_after = time.monotonic() + 3600
-            return None
-        baseline_total, baseline_precise = row
-        cached = (today, baseline_precise if baseline_precise is not None else baseline_total)
-        with _daily_yield_lock:
-            _daily_yield_baseline = cached
+        state = (today, float(wh or 0.0), last_time, last_power)
+    elif state[0] != today:
+        state = (today, 0.0, None, None)
 
-    # max(0, ...) guards boundary jitter rather than ever reporting negative generation.
-    return round(max(0.0, total_kwh - cached[1]), 1)
+    _, wh, last_time, last_power = state
+    if last_time is not None and last_power is not None:
+        gap = (at - last_time).total_seconds()
+        if gap < 0:  # a reading older than the last one (clock step): count nothing, keep the state
+            return round(wh / 1000, 3)
+        wh += last_power * min(gap, PV_ENERGY_MAX_GAP_S) / 3600
+    state = (today, wh, at, power_w)
+    with _pv_energy_lock:
+        _pv_energy = state
+    return round(wh / 1000, 3)
 
 
 def publish_mqtt(mqtt_client, values, prefix, fields=None):
@@ -2036,7 +2035,8 @@ def main():
 
             values, battery = poll_battery(modbus_client)
             ts_ns = time.time_ns()
-            daily = daily_yield_kwh(values["total_power_yields"])
+            daily = pv_energy_today_kwh(values["total_active_power"],
+                                        datetime.fromtimestamp(ts_ns / 1e9).astimezone())
             if daily is not None:
                 values["daily_power_yields"] = daily
             with _state_lock:

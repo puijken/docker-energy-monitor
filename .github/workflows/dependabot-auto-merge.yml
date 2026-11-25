@@ -5,6 +5,8 @@ on: pull_request
 permissions:
   contents: write
   pull-requests: write
+  # For `gh workflow run` below.
+  actions: write
 
 jobs:
   dependabot:
@@ -18,9 +20,23 @@ jobs:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
 
       # Major version bumps are left for manual review/merge.
-      - name: Auto-merge patch/minor updates
+      # Merged directly, not with --auto: there are no required checks, so --auto merged at once
+      # anyway, and the build below must start after the merge. build.yml runs the smoke test
+      # before it pushes, so a broken bump still never reaches :latest.
+      - name: Merge patch/minor updates
         if: steps.metadata.outputs.update-type != 'version-update:semver-major'
-        run: gh pr merge --auto --squash "$PR_URL"
+        run: gh pr merge --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # A push made with GITHUB_TOKEN (the merge above) starts no workflows, so build.yml's push
+      # trigger never fires for a Dependabot merge. workflow_dispatch is the exception GitHub allows,
+      # so start the build explicitly; without this a bump only reached :latest at the next push or
+      # the monthly run.
+      - name: Build the merged update
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        run: gh workflow run build.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

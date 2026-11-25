@@ -580,6 +580,8 @@ Note that Dependabot auto-merges anything it doesn't classify as `semver-major`,
 for status checks that branch protection marks **required**. Without branch protection on `main`,
 `pr-validate` will not block a merge — the pre-push check in `build.yml` is what actually protects
 the published image.
+After the merge, `dependabot-auto-merge.yml` dispatches `build.yml` itself: a merge made with the
+workflow token triggers no `push` build on its own.
 
 ## Docker Compose
 

@@ -1828,6 +1828,27 @@ def check_pv_energy_today(failures):
               "0 at a new day, a failing seed held off; v1 follows")
 
 
+def check_pv_spike_clamp(failures):
+    """app.pv_power_for_energy(): a pv_power spike far above the strings' V x A is replaced by the
+    strings in the energy sum, a normal reading and one without string values are left alone."""
+    before = len(failures)
+    cases = [
+        ("spike", {"total_active_power": 3530, "total_dc_power": 270}, {"pv_power": 3530}, 270),
+        ("spike plus third party", {"total_active_power": 3630, "total_dc_power": 270},
+         {"pv_power": 3530}, 370),
+        ("normal", {"total_active_power": 2350, "total_dc_power": 2340}, {"pv_power": 2350}, 2350),
+        ("just inside margin", {"total_active_power": 470, "total_dc_power": 270},
+         {"pv_power": 470}, 470),
+        ("no string values", {"total_active_power": 3530}, {"pv_power": 3530}, 3530),
+    ]
+    for name, solar, battery, want in cases:
+        got = app.pv_power_for_energy(solar, battery)
+        if got != want:
+            failures.append(f"  pv spike clamp, {name}: expected {want}, got {got}")
+    if len(failures) == before:
+        print("  pv spike clamp: spike replaced by the strings' V x A, normal and string-less untouched")
+
+
 def _monta_charge(i, **over):
     c = {"id": 900000000000000000 + i, "humanReadableId": f"TEST-{i}", "chargePointId": 4242,
          "createdAt": "2026-11-07T14:14:58Z", "updatedAt": "2026-11-07T15:27:15Z",
@@ -1935,6 +1956,7 @@ def main():
     check_smart_meter_source_is_stable(failures)
     check_pvoutput_metrics(failures)
     check_pv_energy_today(failures)
+    check_pv_spike_clamp(failures)
     check_derived_fields(failures)
     check_mppt_negative_current(failures)
     check_solar_stale_fallback(failures)

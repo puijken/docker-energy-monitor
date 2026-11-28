@@ -546,6 +546,9 @@ _pv_energy_retry_after = 0.0
 # A reading counts until the next one, but never for longer than this: a gap in polling is not
 # filled with the last power seen. The same cap as the deploying stack's daily figures.
 PV_ENERGY_MAX_GAP_S = 60
+# At the start of a socket charge pv_power briefly reads far above what the strings deliver (3.5 kW
+# against 270 W); above this margin over the strings' V x A the energy sum uses the strings instead.
+PV_SPIKE_MARGIN_W = 200
 # Monotonic time of the last electricity Postgres write, for P1_MIN_INTERVAL throttling. Owned
 # solely by p1_reader_loop's thread -- no lock needed.
 _last_elec_write_time = 0.0
@@ -794,6 +797,19 @@ def get_pv_energy_today(since):
                 (PV_ENERGY_MAX_GAP_S, since, SOLAR_SOURCE),
             )
             return cur.fetchone()
+
+
+def pv_power_for_energy(solar, battery):
+    """PV power in W for the running energy sum: total_active_power, with pv_power replaced by the
+    strings' summed V x A (total_dc_power) when it exceeds that by more than PV_SPIKE_MARGIN_W.
+    Without string values the power is returned as is. The raw pv_power in the rows is untouched.
+    """
+    power = solar["total_active_power"]
+    dc = solar.get("total_dc_power")
+    pv = battery.get("pv_power")
+    if dc is not None and pv is not None and pv - dc > PV_SPIKE_MARGIN_W:
+        return power - pv + dc
+    return power
 
 
 def pv_energy_today_kwh(power_w, at):
@@ -2035,7 +2051,7 @@ def main():
 
             values, battery = poll_battery(modbus_client)
             ts_ns = time.time_ns()
-            daily = pv_energy_today_kwh(values["total_active_power"],
+            daily = pv_energy_today_kwh(pv_power_for_energy(values, battery),
                                         datetime.fromtimestamp(ts_ns / 1e9).astimezone())
             if daily is not None:
                 values["daily_power_yields"] = daily
